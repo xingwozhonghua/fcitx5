@@ -21,6 +21,7 @@
 #include "fcitx/instance.h"
 #include "isocodes.h"
 #include "keyboard_public.h"
+#include "longpress.h"
 #include "quickphrase_public.h"
 #include "xkbrules.h"
 
@@ -59,15 +60,46 @@ FCITX_CONFIGURATION(
                               "Hint Trigger",
                               _("Trigger hint mode"),
                               {Key("Control+Alt+H")},
-                              KeyListConstrain()};);
+                              KeyListConstrain()};
+    KeyListOption oneTimeHintTrigger{this,
+                                     "One Time Hint Trigger",
+                                     _("Trigger hint mode for one time"),
+                                     {Key("Control+Alt+J")},
+                                     KeyListConstrain()};
+    Option<bool> enableLongPress{this, "EnableLongPress",
+                                 _("Type special characters with long press"),
+                                 false};
+    Option<std::vector<std::string>> blocklistApplicationForLongPress{
+        this,
+        "LongPressBlocklist",
+        _("Applications disabled for long press"),
+        {"konsole"}};
+    SubConfigOption longPress{this, "LongPress", _("Long Press behavior"),
+                              "fcitx://config/addon/keyboard/longpress"};);
 
 class KeyboardEngine;
 
+enum class CandidateMode { Hint, LongPress };
+
 struct KeyboardEngineState : public InputContextProperty {
     bool enableWordHint_ = false;
+    bool oneTimeEnableWordHint_ = false;
     InputBuffer buffer_;
+    CandidateMode mode_ = CandidateMode::Hint;
+    std::string origKeyString_;
+    bool repeatStarted_ = false;
 
-    void reset() { buffer_.clear(); }
+    bool hintEnabled() const {
+        return enableWordHint_ || oneTimeEnableWordHint_;
+    }
+
+    void reset() {
+        origKeyString_.clear();
+        buffer_.clear();
+        mode_ = CandidateMode::Hint;
+        repeatStarted_ = false;
+        oneTimeEnableWordHint_ = false;
+    }
 };
 
 class KeyboardEnginePrivate;
@@ -88,6 +120,10 @@ public:
         reloadConfig();
     }
 
+    const Configuration *getSubConfig(const std::string &path) const override;
+
+    void setSubConfig(const std::string &, const fcitx::RawConfig &) override;
+
     void reset(const InputMethodEntry &entry,
                InputContextEvent &event) override;
 
@@ -100,8 +136,10 @@ public:
 
     void updateCandidate(const InputMethodEntry &entry,
                          InputContext *inputContext);
+    // Update preedit and send ui update.
+    void updateUI(InputContext *inputContext);
 
-    auto state() { return &factory_; }
+    auto factory() { return &factory_; }
 
     bool
     foreachLayout(const std::function<bool(
@@ -113,21 +151,31 @@ public:
             bool(const std::string &variant, const std::string &description,
                  const std::vector<std::string> &languages)> &callback);
 
+    // Return true if chr is pushed to buffer.
+    // Return false if chr will be skipped by buffer, usually this means caller
+    // need to call commit buffer and forward chr manually.
+    bool updateBuffer(InputContext *inputContext, const std::string &chr);
+
+    // Commit current buffer, also reset the state.
+    // See also preeditString().
+    void commitBuffer(InputContext *inputContext);
+
 private:
     FCITX_ADDON_EXPORT_FUNCTION(KeyboardEngine, foreachLayout);
     FCITX_ADDON_EXPORT_FUNCTION(KeyboardEngine, foreachVariant);
 
     bool supportHint(const std::string &language);
     std::string preeditString(InputContext *inputContext);
-    void commitBuffer(InputContext *inputContext);
-    void updateUI(InputContext *inputContext);
     void initQuickPhrase();
+    void showHintNotification(const InputMethodEntry &entry,
+                              KeyboardEngineState *state);
 
     Instance *instance_;
     AddonInstance *spell_ = nullptr;
     AddonInstance *notifications_ = nullptr;
     KeyboardEngineConfig config_;
-    IsoCodes isoCodes_;
+    LongPressConfig longPressConfig_;
+    std::unordered_map<std::string, std::vector<std::string>> longPressData_;
     XkbRules xkbRules_;
     std::string ruleName_;
     KeyList selectionKeys_;
@@ -137,6 +185,10 @@ private:
 
     FactoryFor<KeyboardEngineState> factory_{
         [](InputContext &) { return new KeyboardEngineState; }};
+
+    std::unordered_set<std::string> longPressBlocklistSet_;
+
+    std::unique_ptr<EventSourceTime> cancelLastEvent_;
 };
 
 class KeyboardEngineFactory : public AddonFactory {

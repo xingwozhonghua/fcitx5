@@ -9,7 +9,9 @@
 #include <stdexcept>
 #include <tuple>
 #include <vector>
+#include "fcitx-utils/stringutils.h"
 #include "fcitx-utils/utf8.h"
+
 namespace fcitx {
 
 class TextPrivate {
@@ -104,4 +106,39 @@ std::string Text::toStringForCommit() const {
 
     return result;
 }
+
+std::ostream &operator<<(std::ostream &os, const Text &text) {
+    os << "Text(";
+    for (size_t i = 0; i < text.size(); i++) {
+        os << "<" << text.stringAt(i) << ", flag=" << text.formatAt(i) << ">";
+        if (i + 1 != text.size()) {
+            os << ", ";
+        }
+    }
+    os << ", cursor=" << text.cursor() << ")";
+    return os;
+}
+
+std::vector<Text> Text::splitByLine() const {
+    FCITX_D();
+    std::vector<Text> texts;
+    // Put first line.
+    texts.emplace_back();
+    for (const auto &p : d->texts_) {
+        if (std::get<std::string>(p).empty()) {
+            continue;
+        }
+        auto lines = stringutils::split(std::get<std::string>(p), "\n",
+                                        stringutils::SplitBehavior::KeepEmpty);
+        auto flag = std::get<TextFormatFlags>(p);
+        texts.back().append(lines[0], flag);
+        for (size_t i = 1; i < lines.size(); i++) {
+            texts.emplace_back();
+            texts.back().append(lines[i], flag);
+        }
+    }
+
+    return texts;
+}
+
 } // namespace fcitx

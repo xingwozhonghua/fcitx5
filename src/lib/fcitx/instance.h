@@ -42,7 +42,7 @@ enum class EventWatcherPhase {
     Default = PostInputMethod
 };
 
-struct InstanceQuietQuit : public std::exception {};
+struct FCITXCORE_EXPORT InstanceQuietQuit : public std::exception {};
 
 class FCITXCORE_EXPORT Instance : public ConnectableObject {
 public:
@@ -73,8 +73,48 @@ public:
     const InputMethodEntry *inputMethodEntry(InputContext *ic);
     InputMethodEngine *inputMethodEngine(InputContext *ic);
     InputMethodEngine *inputMethodEngine(const std::string &name);
+    /**
+     * Return the input method icon for input context.
+     *
+     * It will fallback to input-keyboard by default if no input method is
+     * available.
+     *
+     * @param ic input context
+     * @return icon name.
+     *
+     * @see InputMethodEngine::subModeIcon
+     */
+    std::string inputMethodIcon(InputContext *ic);
 
-    uint32_t processCompose(InputContext *ic, KeySym keysym);
+    /**
+     * Handle current XCompose state.
+     *
+     * @param ic input context.
+     * @param keysym key symbol.
+     *
+     * @return unicode
+     *
+     * @see processComposeString
+     */
+    FCITXCORE_DEPRECATED uint32_t processCompose(InputContext *ic,
+                                                 KeySym keysym);
+
+    /**
+     * Handle current XCompose state.
+     *
+     * @param ic input context.
+     * @param keysym key symbol.
+     *
+     * @return the composed string, if it returns nullopt, it means compose is
+     * invalid.
+     *
+     * @see processComposeString
+     * @since 5.0.4
+     */
+    std::optional<std::string> processComposeString(InputContext *ic,
+                                                    KeySym keysym);
+
+    /// Reset the compose state.
     void resetCompose(InputContext *inputContext);
 
     std::string commitFilter(InputContext *inputContext,
@@ -114,6 +154,10 @@ public:
     void reloadConfig();
     /// Reload certain addon config.
     void reloadAddonConfig(const std::string &addonName);
+    /// Load newly installed input methods and addons.
+    void refresh();
+
+    /// Return the current input method of last input context.
     std::string currentInputMethod();
     void setCurrentInputMethod(const std::string &imName);
     void setCurrentInputMethod(InputContext *ic, const std::string &imName,
@@ -138,6 +182,7 @@ private:
 
     bool canTrigger() const;
     bool canAltTrigger(InputContext *ic) const;
+    bool canEnumerate(InputContext *ic) const;
     bool canChangeGroup() const;
     bool trigger(InputContext *ic, bool totallyReleased);
     bool altTrigger(InputContext *ic);

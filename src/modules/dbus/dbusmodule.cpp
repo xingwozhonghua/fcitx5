@@ -5,7 +5,11 @@
  *
  */
 
-#include "dbusmodule.h"
+#include "config.h"
+
+#include <pwd.h>
+#include <sys/types.h>
+#include <fstream>
 #include <set>
 #include <sstream>
 #include <fmt/format.h>
@@ -15,12 +19,17 @@
 #include "fcitx-utils/i18n.h"
 #include "fcitx-utils/stringutils.h"
 #include "fcitx/addonmanager.h"
+#include "fcitx/focusgroup.h"
 #include "fcitx/inputcontextmanager.h"
 #include "fcitx/inputmethodengine.h"
 #include "fcitx/inputmethodentry.h"
 #include "fcitx/inputmethodmanager.h"
+#include "fcitx/misc_p.h"
+#include "dbusmodule.h"
 #include "keyboard_public.h"
+#ifdef ENABLE_X11
 #include "xcb_public.h"
+#endif
 
 #define FCITX_DBUS_SERVICE "org.fcitx.Fcitx5"
 #define FCITX_CONTROLLER_DBUS_INTERFACE "org.fcitx.Fcitx.Controller1"
@@ -37,6 +46,82 @@ namespace {
 constexpr char globalConfigPath[] = "fcitx://config/global";
 constexpr char addonConfigPrefix[] = "fcitx://config/addon/";
 constexpr char imConfigPrefix[] = "fcitx://config/inputmethod/";
+
+#ifdef ENABLE_X11
+std::string X11GetAddress(AddonInstance *xcb, const std::string &display,
+                          xcb_connection_t *conn) {
+    static const char selection_prefix[] = "_DBUS_SESSION_BUS_SELECTION_";
+    static const char address_prefix[] = "_DBUS_SESSION_BUS_ADDRESS";
+    static const char pid_prefix[] = "_DBUS_SESSION_BUS_PID";
+    struct passwd *user;
+
+    auto machine = getLocalMachineId();
+    if (machine.empty()) {
+        return {};
+    }
+
+    user = getpwuid(getuid());
+    if (!user) {
+        return {};
+    }
+    std::string user_name = user->pw_name;
+
+    auto atom_name =
+        stringutils::concat(selection_prefix, user_name, "_", machine);
+    auto selectionAtom =
+        xcb->call<fcitx::IXCBModule::atom>(display, atom_name, false);
+    auto addressAtom =
+        xcb->call<fcitx::IXCBModule::atom>(display, address_prefix, false);
+    auto pidAtom =
+        xcb->call<fcitx::IXCBModule::atom>(display, pid_prefix, false);
+
+    xcb_window_t wid = XCB_WINDOW_NONE;
+    {
+        auto cookie = xcb_get_selection_owner(conn, selectionAtom);
+        auto reply = makeUniqueCPtr(
+            xcb_get_selection_owner_reply(conn, cookie, nullptr));
+        if (!reply || !reply->owner) {
+            return {};
+        }
+        wid = reply->owner;
+    }
+
+    std::string address;
+    {
+        xcb_get_property_cookie_t get_prop_cookie = xcb_get_property(
+            conn, false, wid, addressAtom, XCB_ATOM_STRING, 0, 1024);
+        auto reply = makeUniqueCPtr(
+            xcb_get_property_reply(conn, get_prop_cookie, nullptr));
+
+        if (!reply || reply->type != XCB_ATOM_STRING ||
+            reply->bytes_after > 0 || reply->format != 8) {
+            return {};
+        }
+        auto *data = static_cast<char *>(xcb_get_property_value(reply.get()));
+        int length = xcb_get_property_value_length(reply.get());
+        auto len = strnlen(&(*data), length);
+        address = std::string(&(*data), len);
+    }
+
+    if (address.empty()) {
+        return {};
+    }
+    {
+        xcb_get_property_cookie_t get_prop_cookie = xcb_get_property(
+            conn, false, wid, pidAtom, XCB_ATOM_CARDINAL, 0, sizeof(pid_t));
+        auto reply = makeUniqueCPtr(
+            xcb_get_property_reply(conn, get_prop_cookie, nullptr));
+
+        if (!reply || reply->type != XCB_ATOM_CARDINAL ||
+            reply->bytes_after > 0 || reply->format != 32) {
+            return {};
+        }
+    }
+
+    return address;
+}
+#endif
+
 } // namespace
 
 class Controller1 : public ObjectVTable<Controller1> {
@@ -177,6 +262,14 @@ public:
 
     void removeInputMethodGroup(const std::string &group) {
         instance_->inputMethodManager().removeGroup(group);
+    }
+
+    void switchInputMethodGroup(const std::string &group) {
+        instance_->inputMethodManager().setCurrentGroup(group);
+    }
+
+    std::string currentInputMethodGroup() {
+        return instance_->inputMethodManager().currentGroup().name();
     }
 
     std::tuple<dbus::Variant, DBusConfig> getConfig(const std::string &uri) {
@@ -420,13 +513,16 @@ public:
     }
 
     void openX11Connection(const std::string &name) {
+#ifdef ENABLE_X11
         if (auto *xcb = module_->xcb()) {
             xcb->call<IXCBModule::openConnection>(name);
-        } else {
-            throw dbus::MethodCallError(
-                "org.freedesktop.DBus.Error.InvalidArgs",
-                "XCB addon is not available.");
+            return;
         }
+#else
+        FCITX_UNUSED(name);
+#endif
+        throw dbus::MethodCallError("org.freedesktop.DBus.Error.InvalidArgs",
+                                    "XCB addon is not available.");
     }
 
     std::string debugInfo() {
@@ -441,6 +537,7 @@ public:
                 }
                 ss << "] program:" << ic->program()
                    << " frontend:" << ic->frontend()
+                   << " cap:" << fmt::format("{:x}", ic->capabilityFlags())
                    << " focus:" << ic->hasFocus() << std::endl;
                 return true;
             });
@@ -463,6 +560,15 @@ public:
         return ss.str();
     }
 
+    void refresh() {
+        deferEvent_ =
+            instance_->eventLoop().addDeferEvent([this](EventSource *) {
+                instance_->refresh();
+                deferEvent_.reset();
+                return false;
+            });
+    }
+
 private:
     DBusModule *module_;
     Instance *instance_;
@@ -481,6 +587,10 @@ private:
                                "");
     FCITX_OBJECT_VTABLE_METHOD(removeInputMethodGroup, "RemoveInputMethodGroup",
                                "s", "");
+    FCITX_OBJECT_VTABLE_METHOD(switchInputMethodGroup, "SwitchInputMethodGroup",
+                               "s", "");
+    FCITX_OBJECT_VTABLE_METHOD(currentInputMethodGroup,
+                               "CurrentInputMethodGroup", "", "s");
     FCITX_OBJECT_VTABLE_METHOD(availableInputMethods, "AvailableInputMethods",
                                "", "a(ssssssb)");
     FCITX_OBJECT_VTABLE_METHOD(inputMethodGroupInfo, "InputMethodGroupInfo",
@@ -514,12 +624,12 @@ private:
     FCITX_OBJECT_VTABLE_METHOD(setAddonsState, "SetAddonsState", "a(sb)", "");
     FCITX_OBJECT_VTABLE_METHOD(openX11Connection, "OpenX11Connection", "s", "");
     FCITX_OBJECT_VTABLE_METHOD(debugInfo, "DebugInfo", "", "s");
+    FCITX_OBJECT_VTABLE_METHOD(refresh, "Refresh", "", "");
 };
 
 DBusModule::DBusModule(Instance *instance)
-    : bus_(std::make_unique<dbus::Bus>(dbus::BusType::Session)),
-      serviceWatcher_(std::make_unique<dbus::ServiceWatcher>(*bus_)),
-      instance_(instance) {
+    : instance_(instance), bus_(connectToSessionBus()),
+      serviceWatcher_(std::make_unique<dbus::ServiceWatcher>(*bus_)) {
     bus_->attachEventLoop(&instance->eventLoop());
     auto uniqueName = bus_->uniqueName();
     Flags<RequestNameFlag> requestFlag = RequestNameFlag::AllowReplacement;
@@ -528,7 +638,8 @@ DBusModule::DBusModule(Instance *instance)
     }
     if (!bus_->requestName(FCITX_DBUS_SERVICE, requestFlag)) {
         instance_->exit();
-        throw std::runtime_error("Unable to request dbus name");
+        throw std::runtime_error("Unable to request dbus name. Is there "
+                                 "another fcitx already running?");
     }
 
     disconnectedSlot_ = bus_->addMatch(
@@ -562,6 +673,36 @@ DBusModule::DBusModule(Instance *instance)
 
 DBusModule::~DBusModule() {}
 
+std::unique_ptr<dbus::Bus> DBusModule::connectToSessionBus() {
+    try {
+        auto bus = std::make_unique<dbus::Bus>(dbus::BusType::Session);
+        return bus;
+    } catch (...) {
+    }
+#ifdef ENABLE_X11
+    if (auto *xcbAddon = xcb()) {
+        std::string address;
+        // This callback should be called immediately for all existing X11
+        // connection.
+        auto callback =
+            xcbAddon->call<IXCBModule::addConnectionCreatedCallback>(
+                [xcbAddon, &address](const std::string &name,
+                                     xcb_connection_t *conn, int,
+                                     FocusGroup *) {
+                    if (!address.empty()) {
+                        return;
+                    }
+                    address = X11GetAddress(xcbAddon, name, conn);
+                });
+        FCITX_DEBUG() << "DBus address from X11: " << address;
+        if (!address.empty()) {
+            return std::make_unique<dbus::Bus>(address);
+        }
+    }
+#endif
+    throw std::runtime_error("Failed to connect to session dbus");
+}
+
 dbus::Bus *DBusModule::bus() { return bus_.get(); }
 
 bool DBusModule::lockGroup(int group) {
@@ -574,6 +715,8 @@ bool DBusModule::lockGroup(int group) {
     msg << group;
     return msg.send();
 }
+
+bool DBusModule::hasXkbHelper() const { return !xkbHelperName_.empty(); }
 
 class DBusModuleFactory : public AddonFactory {
     AddonInstance *create(AddonManager *manager) override {

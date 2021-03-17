@@ -25,11 +25,16 @@
 #include "fcitx/instance.h"
 #include "chardata.h"
 #include "config.h"
-#include "emoji_public.h"
+#include "longpress.h"
 #include "notifications_public.h"
 #include "quickphrase_public.h"
 #include "spell_public.h"
+
+#ifdef ENABLE_X11
 #include "xcb_public.h"
+#endif
+
+#include "emoji_public.h"
 
 const char imNamePrefix[] = "keyboard-";
 #define FCITX_KEYBOARD_MAX_BUFFER 20
@@ -37,7 +42,6 @@ const char imNamePrefix[] = "keyboard-";
 namespace fcitx {
 
 namespace {
-
 enum class SpellType { AllLower, Mixed, FirstUpper, AllUpper };
 
 SpellType guessSpellType(const std::string &input) {
@@ -145,13 +149,60 @@ std::string findBestLanguage(const IsoCodes &isocodes, const std::string &hint,
     }
     return {};
 }
+
+class KeyboardCandidateWord : public CandidateWord {
+public:
+    KeyboardCandidateWord(KeyboardEngine *engine, Text text)
+        : CandidateWord(std::move(text)), engine_(engine) {}
+
+    void select(InputContext *inputContext) const override {
+        auto commit = text().toString();
+        inputContext->inputPanel().reset();
+        inputContext->updatePreedit();
+        inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+        inputContext->commitString(commit);
+        engine_->resetState(inputContext);
+    }
+
+private:
+    KeyboardEngine *engine_;
+};
+
+class LongPressCandidateWord : public CandidateWord {
+public:
+    LongPressCandidateWord(KeyboardEngine *engine, const std::string &text,
+                           int index)
+        : CandidateWord(Text(stringutils::concat(text, "\n", index))),
+          engine_(engine), text_(text) {}
+
+    const std::string &str() const { return text_; }
+
+    void select(InputContext *inputContext) const override {
+        auto state = inputContext->propertyFor(engine_->factory());
+        state->mode_ = CandidateMode::Hint;
+        // Make sure the candidate is from not from long press mode.
+        inputContext->inputPanel().setCandidateList(nullptr);
+        if (!engine_->updateBuffer(inputContext, text_)) {
+            engine_->commitBuffer(inputContext);
+            inputContext->inputPanel().reset();
+            engine_->updateUI(inputContext);
+            inputContext->commitString(text_);
+        }
+    }
+
+private:
+    KeyboardEngine *engine_;
+    std::string text_;
+};
+
 } // namespace
 
 KeyboardEngine::KeyboardEngine(Instance *instance) : instance_(instance) {
+    setupDefaultLongPressConfig(longPressConfig_);
     registerDomain("xkeyboard-config", XKEYBOARDCONFIG_DATADIR "/locale");
-    isoCodes_.read(ISOCODES_ISO639_JSON, ISOCODES_ISO3166_JSON);
-    auto *xcb = instance_->addonManager().addon("xcb");
     std::string rule;
+#ifdef ENABLE_X11
+    auto *xcb = instance_->addonManager().addon("xcb");
     if (xcb) {
         auto rules = xcb->call<IXCBModule::xkbRulesNames>("");
         if (!rules[0].empty()) {
@@ -163,6 +214,7 @@ KeyboardEngine::KeyboardEngine(Instance *instance) : instance_(instance) {
             ruleName_ = rule;
         }
     }
+#endif
     if (rule.empty() || !xkbRules_.read(rule)) {
         rule = XKEYBOARDCONFIG_XKBBASE "/rules/" DEFAULT_XKB_RULES ".xml";
         xkbRules_.read(rule);
@@ -183,11 +235,14 @@ KeyboardEngine::KeyboardEngine(Instance *instance) : instance_(instance) {
 KeyboardEngine::~KeyboardEngine() {}
 
 std::vector<InputMethodEntry> KeyboardEngine::listInputMethods() {
+    IsoCodes isoCodes;
+    isoCodes.read(ISOCODES_ISO639_JSON, ISOCODES_ISO3166_JSON);
+
     std::vector<InputMethodEntry> result;
     bool usExists = false;
     for (const auto &p : xkbRules_.layoutInfos()) {
         const auto &layoutInfo = p.second;
-        auto language = findBestLanguage(isoCodes_, layoutInfo.description,
+        auto language = findBestLanguage(isoCodes, layoutInfo.description,
                                          layoutInfo.languages);
         auto description =
             fmt::format(_("Keyboard - {0}"),
@@ -198,11 +253,13 @@ std::vector<InputMethodEntry> KeyboardEngine::listInputMethods() {
         }
         result.push_back(std::move(
             InputMethodEntry(uniqueName, description, language, "keyboard")
-                .setLabel(layoutInfo.name)
+                .setLabel(layoutInfo.shortDescription.empty()
+                              ? layoutInfo.name
+                              : layoutInfo.shortDescription)
                 .setIcon("input-keyboard")
                 .setConfigurable(true)));
         for (const auto &variantInfo : layoutInfo.variantInfos) {
-            auto language = findBestLanguage(isoCodes_, variantInfo.description,
+            auto language = findBestLanguage(isoCodes, variantInfo.description,
                                              !variantInfo.languages.empty()
                                                  ? variantInfo.languages
                                                  : layoutInfo.languages);
@@ -214,7 +271,9 @@ std::vector<InputMethodEntry> KeyboardEngine::listInputMethods() {
                                                   "-", variantInfo.name);
             result.push_back(std::move(
                 InputMethodEntry(uniqueName, description, language, "keyboard")
-                    .setLabel(layoutInfo.name)
+                    .setLabel(variantInfo.shortDescription.empty()
+                                  ? layoutInfo.name
+                                  : variantInfo.shortDescription)
                     .setIcon("input-keyboard")
                     .setConfigurable(true)));
         }
@@ -294,6 +353,12 @@ void KeyboardEngine::reloadConfig() {
     for (auto sym : syms) {
         selectionKeys_.emplace_back(sym, states);
     }
+    longPressBlocklistSet_ = decltype(longPressBlocklistSet_)(
+        config_.blocklistApplicationForLongPress->begin(),
+        config_.blocklistApplicationForLongPress->end());
+
+    readAsIni(longPressConfig_, "conf/keyboard-longpress.conf");
+    longPressData_ = longPressData(longPressConfig_);
 }
 
 static inline bool isValidSym(const Key &key) {
@@ -304,201 +369,250 @@ static inline bool isValidSym(const Key &key) {
     return validSyms.count(key.sym());
 }
 
-static inline bool isValidCharacter(uint32_t c) {
-    if (c == 0 || c == FCITX_INVALID_COMPOSE_RESULT) {
+static inline bool isValidCharacter(const std::string &c) {
+    if (c.empty()) {
         return false;
     }
 
-    return validChars.count(c);
+    uint32_t code;
+    auto iter = utf8::getNextChar(c.begin(), c.end(), &code);
+
+    return iter == c.end() && validChars.count(code);
 }
 
 static KeyList FCITX_HYPHEN_APOS = Key::keyListFromString("minus apostrophe");
 
+bool KeyboardEngine::updateBuffer(InputContext *inputContext,
+                                  const std::string &chr) {
+    auto *entry = instance_->inputMethodEntry(inputContext);
+    if (!entry) {
+        return false;
+    }
+
+    auto *state = inputContext->propertyFor(&factory_);
+    const CapabilityFlags noPredictFlag{CapabilityFlag::Password,
+                                        CapabilityFlag::NoSpellCheck,
+                                        CapabilityFlag::Sensitive};
+    // no spell hint enabled or no supported dictionary
+    if (!state->hintEnabled() ||
+        inputContext->capabilityFlags().testAny(noPredictFlag) ||
+        !supportHint(entry->languageCode())) {
+        return false;
+    }
+
+    auto &buffer = state->buffer_;
+    auto preedit = preeditString(inputContext);
+    if (preedit != buffer.userInput()) {
+        buffer.clear();
+        buffer.type(preedit);
+    }
+
+    buffer.type(chr);
+
+    if (buffer.size() >= FCITX_KEYBOARD_MAX_BUFFER) {
+        commitBuffer(inputContext);
+        return true;
+    }
+
+    updateCandidate(*entry, inputContext);
+    return true;
+}
+
 void KeyboardEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
-    // FIXME use entry to get layout info
     FCITX_UNUSED(entry);
+    auto *inputContext = event.inputContext();
 
     // by pass all key release
     if (event.isRelease()) {
         return;
     }
 
+    auto *state = inputContext->propertyFor(&factory_);
+    if (state->repeatStarted_ &&
+        !event.rawKey().states().test(KeyState::Repeat)) {
+        state->repeatStarted_ = false;
+    }
+
     // and by pass all modifier
     if (event.key().isModifier()) {
         return;
     }
-    auto *inputContext = event.inputContext();
-    auto *state = inputContext->propertyFor(&factory_);
+
+    auto &buffer = state->buffer_;
+    auto keystr = Key::keySymToUTF8(event.key().sym());
+    if (!event.key().states() &&
+        event.rawKey().states().test(KeyState::Repeat) &&
+        *config_.enableLongPress &&
+        !longPressBlocklistSet_.count(inputContext->program())) {
+        if (auto results = findValue(longPressData_, keystr)) {
+            if (state->repeatStarted_) {
+                return event.filterAndAccept();
+            }
+            state->repeatStarted_ = true;
+
+            state->mode_ = CandidateMode::LongPress;
+            state->origKeyString_ = keystr;
+            if (buffer.empty()) {
+                if (inputContext->capabilityFlags().test(
+                        CapabilityFlag::SurroundingText)) {
+                    inputContext->deleteSurroundingText(-1, 1);
+                } else {
+                    inputContext->forwardKey(Key(FcitxKey_BackSpace));
+                }
+            } else {
+                buffer.backspace();
+            }
+
+            inputContext->inputPanel().reset();
+            auto candidateList = std::make_unique<CommonCandidateList>();
+            int i = 1;
+            for (const auto &result : *results) {
+                candidateList->append<LongPressCandidateWord>(this, result,
+                                                              i++);
+            }
+            candidateList->setPageSize(results->size());
+            candidateList->setCursorIncludeUnselected(true);
+            inputContext->inputPanel().setCandidateList(
+                std::move(candidateList));
+
+            updateUI(inputContext);
+            return event.filterAndAccept();
+        }
+    }
 
     // check compose first.
-    auto compose = instance_->processCompose(inputContext, event.key().sym());
+    auto composeResult =
+        instance_->processComposeString(inputContext, event.key().sym());
 
     // compose is invalid, ignore it.
-    if (compose == FCITX_INVALID_COMPOSE_RESULT) {
+    if (!composeResult) {
         return event.filterAndAccept();
     }
+
+    auto compose = *composeResult;
 
     // check the spell trigger key
     if (event.key().checkKeyList(config_.hintTrigger.value()) &&
         supportHint(entry.languageCode())) {
         state->enableWordHint_ = !state->enableWordHint_;
+        state->oneTimeEnableWordHint_ = false;
         commitBuffer(inputContext);
-        if (notifications()) {
-            bool hasSpell = spell() && spell()->call<ISpell::checkDict>(
-                                           entry.languageCode());
-            std::string extra;
-            if (!hasSpell) {
-                extra += " ";
-                extra += _("Only emoji support is found. To enable spell "
-                           "checking, you may need to install spell check data "
-                           "for the language.");
-            }
-            notifications()->call<INotifications::showTip>(
-                "fcitx-keyboard-hint", _("Input Method"),
-                "tools-check-spelling", _("Completion"),
-                state->enableWordHint_
-                    ? stringutils::concat(_("Completion is enabled."), extra)
-                    : _("Completion is disabled."),
-                -1);
-        }
+        showHintNotification(entry, state);
         return event.filterAndAccept();
     }
 
-    do {
-        // no spell hint enabled, ignore
-        if (!state->enableWordHint_) {
-            break;
-        }
-        const CapabilityFlags noPredictFlag{CapabilityFlag::Password,
-                                            CapabilityFlag::NoSpellCheck,
-                                            CapabilityFlag::Sensitive};
-        // no supported dictionary
-        if (inputContext->capabilityFlags().testAny(noPredictFlag) ||
-            !supportHint(entry.languageCode())) {
-            break;
+    // check the spell trigger key
+    if (event.key().checkKeyList(config_.oneTimeHintTrigger.value()) &&
+        supportHint(entry.languageCode())) {
+        bool oldOneTime = state->oneTimeEnableWordHint_;
+        state->enableWordHint_ = false;
+        commitBuffer(inputContext);
+        // This need to be set after commit buffer.
+        state->oneTimeEnableWordHint_ = !oldOneTime;
+        showHintNotification(entry, state);
+        return event.filterAndAccept();
+    }
+
+    // check if we can select candidate.
+    if (auto candList = inputContext->inputPanel().candidateList()) {
+        int idx = event.key().keyListIndex(selectionKeys_);
+        if (idx >= 0 && idx < candList->size()) {
+            event.filterAndAccept();
+            candList->candidate(idx).select(inputContext);
+            return;
         }
 
-        // check if we can select candidate.
-        if (auto candList = inputContext->inputPanel().candidateList()) {
-            int idx = event.key().keyListIndex(selectionKeys_);
-            if (idx >= 0 && idx < candList->size()) {
-                event.filterAndAccept();
-                candList->candidate(idx).select(inputContext);
-                return;
+        auto *movable = candList->toCursorMovable();
+        if (movable) {
+            if (event.key().checkKeyList(*config_.nextCandidate)) {
+                movable->nextCandidate();
+                updateUI(inputContext);
+                return event.filterAndAccept();
             }
-
-            auto *movable = candList->toCursorMovable();
-            if (movable) {
-                if (event.key().checkKeyList(*config_.nextCandidate)) {
-                    movable->nextCandidate();
-                    updateUI(inputContext);
-                    return event.filterAndAccept();
-                }
-                if (event.key().checkKeyList(*config_.prevCandidate)) {
-                    movable->prevCandidate();
-                    updateUI(inputContext);
-                    return event.filterAndAccept();
-                }
+            if (event.key().checkKeyList(*config_.prevCandidate)) {
+                movable->prevCandidate();
+                updateUI(inputContext);
+                return event.filterAndAccept();
             }
         }
+    }
 
-        auto &buffer = state->buffer_;
-        bool validCharacter = isValidCharacter(compose);
-        bool validSym = isValidSym(event.key());
+    bool validCharacter = isValidCharacter(compose);
+    bool validSym = isValidSym(event.key());
 
-        // check for valid character
-        if (validCharacter || event.key().isSimple() || validSym) {
-            if (validCharacter || event.key().isLAZ() || event.key().isUAZ() ||
-                validSym ||
-                (!buffer.empty() &&
-                 event.key().checkKeyList(FCITX_HYPHEN_APOS))) {
-                auto preedit = preeditString(inputContext);
-                if (preedit != buffer.userInput()) {
-                    buffer.clear();
-                    buffer.type(preedit);
-                }
-
-                if (compose) {
-                    buffer.type(compose);
-                } else {
-                    buffer.type(Key::keySymToUnicode(event.key().sym()));
-                }
-
-                event.filterAndAccept();
-                if (buffer.size() >= FCITX_KEYBOARD_MAX_BUFFER) {
-                    commitBuffer(inputContext);
-                    return;
-                }
-
-                return updateCandidate(entry, inputContext);
-            }
-        } else {
-            if (event.key().check(FcitxKey_BackSpace)) {
-                if (buffer.backspace()) {
-                    event.filterAndAccept();
-                    return updateCandidate(entry, inputContext);
-                }
+    // check for valid character
+    if (validCharacter || event.key().isSimple() || validSym) {
+        if (validCharacter || event.key().isLAZ() || event.key().isUAZ() ||
+            validSym ||
+            (!buffer.empty() && event.key().checkKeyList(FCITX_HYPHEN_APOS))) {
+            auto text = !compose.empty() ? compose
+                                         : Key::keySymToUTF8(event.key().sym());
+            if (updateBuffer(inputContext, text)) {
+                return event.filterAndAccept();
             }
         }
-
-        // if we reach here, just commit and discard buffer.
-        if (!state->buffer_.empty()) {
-            commitBuffer(inputContext);
+    } else if (event.key().check(FcitxKey_BackSpace)) {
+        if (buffer.backspace()) {
+            event.filterAndAccept();
+            if (buffer.empty()) {
+                return reset(entry, event);
+            }
+            return updateCandidate(entry, inputContext);
         }
-    } while (0);
+    }
 
+    // if we reach here, just commit and discard buffer.
+    commitBuffer(inputContext);
     // and now we want to forward key.
-    if (compose) {
-        auto composeString = utf8::UCS4ToUTF8(compose);
+    if (!compose.empty()) {
         event.filterAndAccept();
-        inputContext->commitString(composeString);
+        inputContext->commitString(compose);
     }
 }
 
 void KeyboardEngine::commitBuffer(InputContext *inputContext) {
-    auto *state = inputContext->propertyFor(&factory_);
-    auto &buffer = state->buffer_;
-    if (!buffer.empty()) {
-        inputContext->commitString(preeditString(inputContext));
-        resetState(inputContext);
-        inputContext->inputPanel().reset();
-        inputContext->updatePreedit();
-        inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+    auto preedit = preeditString(inputContext);
+    if (preedit.empty()) {
+        return;
     }
+    inputContext->commitString(preedit);
+    resetState(inputContext);
+    inputContext->inputPanel().reset();
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
 }
 
-class KeyboardCandidateWord : public CandidateWord {
-public:
-    KeyboardCandidateWord(KeyboardEngine *engine, Text text)
-        : CandidateWord(std::move(text)), engine_(engine) {}
-
-    void select(InputContext *inputContext) const override {
-        auto commit = text().toString();
-        inputContext->inputPanel().reset();
-        inputContext->updatePreedit();
-        inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
-        inputContext->commitString(commit);
-        engine_->resetState(inputContext);
-    }
-
-private:
-    KeyboardEngine *engine_;
-};
-
 bool KeyboardEngine::supportHint(const std::string &language) {
-    bool hasSpell = spell() && spell()->call<ISpell::checkDict>(language);
-
-    bool hasEmoji = *config_.enableEmoji && emoji() &&
-                    emoji()->call<IEmoji::check>(language, true);
+    const bool hasSpell = spell() && spell()->call<ISpell::checkDict>(language);
+    const bool hasEmoji = *config_.enableEmoji && emoji() &&
+                          emoji()->call<IEmoji::check>(language, true);
     return hasSpell || hasEmoji;
 }
 
 std::string KeyboardEngine::preeditString(InputContext *inputContext) {
     auto *state = inputContext->propertyFor(&factory_);
-    auto candidate = inputContext->inputPanel().candidateList();
+    auto candidateList = inputContext->inputPanel().candidateList();
     std::string preedit;
-    if (candidate && candidate->cursorIndex() >= 0) {
-        return candidate->candidate(candidate->cursorIndex()).text().toString();
+    if (state->mode_ == CandidateMode::Hint) {
+        if (candidateList && candidateList->cursorIndex() >= 0) {
+            if (const auto *candidate =
+                    dynamic_cast<const KeyboardCandidateWord *>(
+                        &candidateList->candidate(
+                            candidateList->cursorIndex()))) {
+                return candidate->text().toString();
+            }
+        }
+        return state->buffer_.userInput();
+    } else if (state->mode_ == CandidateMode::LongPress) {
+        if (candidateList && candidateList->cursorIndex() >= 0) {
+            if (const auto *candidate =
+                    dynamic_cast<const LongPressCandidateWord *>(
+                        &candidateList->candidate(
+                            candidateList->cursorIndex()))) {
+                return state->buffer_.userInput() + candidate->str();
+            }
+        }
+        return state->buffer_.userInput() + state->origKeyString_;
     }
     return state->buffer_.userInput();
 }
@@ -518,6 +632,7 @@ void KeyboardEngine::updateUI(InputContext *inputContext) {
 
 void KeyboardEngine::updateCandidate(const InputMethodEntry &entry,
                                      InputContext *inputContext) {
+    inputContext->inputPanel().reset();
     auto *state = inputContext->propertyFor(&factory_);
     std::vector<std::string> results;
     if (spell()) {
@@ -552,6 +667,7 @@ void KeyboardEngine::updateCandidate(const InputMethodEntry &entry,
     candidateList->setPageSize(*config_.pageSize);
     candidateList->setSelectionKey(selectionKeys_);
     candidateList->setCursorIncludeUnselected(true);
+    state->mode_ = CandidateMode::Hint;
     inputContext->inputPanel().setCandidateList(std::move(candidateList));
 
     updateUI(inputContext);
@@ -634,6 +750,52 @@ void KeyboardEngine::initQuickPhrase() {
             }
             return true;
         });
+}
+
+void KeyboardEngine::showHintNotification(const InputMethodEntry &entry,
+                                          KeyboardEngineState *state) {
+    if (!notifications()) {
+        return;
+    }
+    bool hasSpell =
+        spell() && spell()->call<ISpell::checkDict>(entry.languageCode());
+    std::string extra;
+    if (!hasSpell) {
+        extra += " ";
+        extra += _("Only emoji support is found. To enable spell "
+                   "checking, you may need to install spell check data "
+                   "for the language.");
+    }
+    std::string message;
+    if (!state->hintEnabled()) {
+        message = _("Completion is disabled.");
+    } else if (state->oneTimeEnableWordHint_) {
+        message =
+            stringutils::concat(_("Completion is enabled temporarily."), extra);
+    } else {
+        message = stringutils::concat(_("Completion is enabled."), extra);
+    }
+    notifications()->call<INotifications::showTip>(
+        "fcitx-keyboard-hint", _("Input Method"), "tools-check-spelling",
+        _("Completion"), message, -1);
+}
+
+const Configuration *
+KeyboardEngine::getSubConfig(const std::string &path) const {
+    if (path == "longpress") {
+        return &longPressConfig_;
+    }
+    return nullptr;
+}
+
+void KeyboardEngine::setSubConfig(const std::string &path,
+                                  const RawConfig &config) {
+
+    if (path == "longpress") {
+        longPressConfig_.load(config, true);
+        safeSaveAsIni(longPressConfig_, "conf/keyboard-longpress.conf");
+        reloadConfig();
+    }
 }
 
 } // namespace fcitx

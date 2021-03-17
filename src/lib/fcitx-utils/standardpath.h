@@ -190,6 +190,7 @@ public:
         PkgData
     };
 
+    StandardPath(bool skipFcitxPath, bool skipUserPath);
     StandardPath(bool skipFcitxPath = false);
     virtual ~StandardPath();
 
@@ -216,6 +217,15 @@ public:
     void scanDirectories(Type type,
                          const std::function<bool(const std::string &path,
                                                   bool user)> &scanner) const;
+
+    /// \brief Scan the given directories.
+    ///
+    /// Callback returns true to continue the scan.
+    /// @since 5.0.4
+    void scanDirectories(
+        const std::string &userDir, const std::vector<std::string> &directories,
+        const std::function<bool(const std::string &path, bool user)> &scanner)
+        const;
 
     /// \brief Scan files scan file under [directory]/[path]
     /// \param path sub directory name.
@@ -247,6 +257,14 @@ public:
     /// \brief Open the user file.
     StandardPathFile openUser(Type type, const std::string &path,
                               int flags) const;
+
+    /**
+     * \brief Open the non-user file.
+     *
+     * \since 5.0.6
+     */
+    StandardPathFile openSystem(Type type, const std::string &path,
+                                int flags) const;
 
     /// \brief Open user file, but create file with mktemp.
     StandardPathTempFile openUserTemp(Type type,

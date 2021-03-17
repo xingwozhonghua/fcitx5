@@ -18,8 +18,6 @@
 
 namespace fcitx {
 
-static_assert(sizeof(uuid_t) == 16, "uuid size mismatch");
-
 InputContext::InputContext(InputContextManager &manager,
                            const std::string &program)
     : d_ptr(std::make_unique<InputContextPrivate>(this, manager, program)) {
@@ -102,53 +100,48 @@ void InputContext::updateProperty(const InputContextPropertyFactory *factory) {
     d->manager_.propagateProperty(*this, factory);
 }
 
+CapabilityFlags calculateFlags(CapabilityFlags flag, bool isPreeditEnabled) {
+    if (!isPreeditEnabled) {
+        flag = flag.unset(CapabilityFlag::Preedit)
+                   .unset(CapabilityFlag::FormattedPreedit);
+    }
+    return flag;
+}
+
 void InputContext::setCapabilityFlags(CapabilityFlags flags) {
     FCITX_D();
-    const auto oldFlags = capabilityFlags();
-    auto newFlags = flags;
-    if (!d->isPreeditEnabled_) {
-        newFlags = newFlags.unset(CapabilityFlag::Preedit)
-                       .unset(CapabilityFlag::FormattedPreedit);
+    if (d->capabilityFlags_ == flags) {
+        return;
     }
-    if (d->capabilityFlags_ != flags) {
-        if (oldFlags != newFlags) {
-            d->emplaceEvent<CapabilityAboutToChangeEvent>(this, oldFlags,
-                                                          flags);
-        }
-        d->capabilityFlags_ = flags;
-        if (oldFlags != newFlags) {
-            d->emplaceEvent<CapabilityChangedEvent>(this, oldFlags, flags);
-        }
+    const auto oldFlags = capabilityFlags();
+    auto newFlags = calculateFlags(flags, d->isPreeditEnabled_);
+    if (oldFlags != newFlags) {
+        d->emplaceEvent<CapabilityAboutToChangeEvent>(this, oldFlags, flags);
+    }
+    d->capabilityFlags_ = flags;
+    if (oldFlags != newFlags) {
+        d->emplaceEvent<CapabilityChangedEvent>(this, oldFlags, flags);
     }
 }
 
 CapabilityFlags InputContext::capabilityFlags() const {
     FCITX_D();
-    auto flags = d->capabilityFlags_;
-    if (!d->isPreeditEnabled_) {
-        flags = flags.unset(CapabilityFlag::Preedit)
-                    .unset(CapabilityFlag::FormattedPreedit);
-    }
-    return flags;
+    return calculateFlags(d->capabilityFlags_, d->isPreeditEnabled_);
 }
 
 void InputContext::setEnablePreedit(bool enable) {
     FCITX_D();
-    const auto oldFlags = capabilityFlags();
-    auto newFlags = d->capabilityFlags_;
-    if (!enable) {
-        newFlags = newFlags.unset(CapabilityFlag::Preedit)
-                       .unset(CapabilityFlag::FormattedPreedit);
+    if (enable == d->isPreeditEnabled_) {
+        return;
     }
-    if (enable != d->isPreeditEnabled_) {
-        if (oldFlags != newFlags) {
-            d->emplaceEvent<CapabilityAboutToChangeEvent>(this, oldFlags,
-                                                          newFlags);
-        }
-        d->isPreeditEnabled_ = enable;
-        if (oldFlags != newFlags) {
-            d->emplaceEvent<CapabilityChangedEvent>(this, oldFlags, newFlags);
-        }
+    const auto oldFlags = capabilityFlags();
+    auto newFlags = calculateFlags(d->capabilityFlags_, enable);
+    if (oldFlags != newFlags) {
+        d->emplaceEvent<CapabilityAboutToChangeEvent>(this, oldFlags, newFlags);
+    }
+    d->isPreeditEnabled_ = enable;
+    if (oldFlags != newFlags) {
+        d->emplaceEvent<CapabilityChangedEvent>(this, oldFlags, newFlags);
     }
 }
 
@@ -310,9 +303,7 @@ void InputContext::updatePreedit() {
 void InputContext::updateUserInterface(UserInterfaceComponent component,
                                        bool immediate) {
     FCITX_D();
-    if (!d->capabilityFlags_.test(CapabilityFlag::ClientSideUI)) {
-        d->emplaceEvent<InputContextUpdateUIEvent>(component, this, immediate);
-    }
+    d->emplaceEvent<InputContextUpdateUIEvent>(component, this, immediate);
 }
 
 InputPanel &InputContext::inputPanel() {

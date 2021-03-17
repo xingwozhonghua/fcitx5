@@ -6,6 +6,7 @@
  */
 
 #include "kimpanel.h"
+#include <fcitx/inputmethodengine.h>
 #include "fcitx-utils/dbus/objectvtable.h"
 #include "fcitx-utils/dbus/servicewatcher.h"
 #include "fcitx-utils/i18n.h"
@@ -112,8 +113,7 @@ private:
 };
 
 Kimpanel::Kimpanel(Instance *instance)
-    : instance_(instance),
-      bus_(instance_->addonManager().addon("dbus")->call<IDBusModule::bus>()),
+    : instance_(instance), bus_(dbus()->call<IDBusModule::bus>()),
       watcher_(*bus_) {
     entry_ = watcher_.watchService(
         "org.kde.impanel", [this](const std::string &, const std::string &,
@@ -144,7 +144,9 @@ void Kimpanel::registerAllProperties(InputContext *ic) {
             props.push_back(actionToStatus(action, ic));
         }
     }
-    props.push_back(inputMethodStatus(ic));
+
+    const auto imStatus = inputMethodStatus(ic);
+    props.push_back(imStatus);
 
     if (ic) {
         for (auto group :
@@ -156,6 +158,8 @@ void Kimpanel::registerAllProperties(InputContext *ic) {
     }
 
     proxy_->registerProperties(props);
+    proxy_->updateProperty(imStatus);
+    proxy_->enable(true);
 
     bus_->flush();
 }
@@ -166,9 +170,9 @@ std::string Kimpanel::actionToStatus(Action *action, InputContext *ic) {
     if (action->menu()) {
         type = "menu";
     }
-    return stringutils::concat("/Fcitx/", action->name(), ":",
-                               action->shortText(ic), ":", action->icon(ic),
-                               ":", action->longText(ic), ":", type);
+    return stringutils::concat(
+        "/Fcitx/", action->name(), ":", action->shortText(ic), ":",
+        iconName(action->icon(ic)), ":", action->longText(ic), ":", type);
 }
 
 void Kimpanel::resume() {
@@ -239,16 +243,11 @@ void Kimpanel::resume() {
     eventHandlers_.emplace_back(instance_->watchEvent(
         EventType::InputContextFocusIn, EventWatcherPhase::Default,
         [this](Event &event) {
+            // Difference IC has difference set of actions.
             auto &icEvent = static_cast<InputContextEvent &>(event);
+            registerAllProperties(icEvent.inputContext());
             updateCurrentInputMethod(icEvent.inputContext());
         }));
-    eventHandlers_.emplace_back(
-        instance_->watchEvent(EventType::InputContextFocusOut,
-                              EventWatcherPhase::Default, [this](Event &) {
-                                  if (!instance_->lastFocusedInputContext()) {
-                                      proxy_->enable(false);
-                                  }
-                              }));
 }
 
 void Kimpanel::update(UserInterfaceComponent component,
@@ -360,14 +359,21 @@ void Kimpanel::updateInputPanel(InputContext *inputContext) {
 }
 
 std::string Kimpanel::inputMethodStatus(InputContext *ic) {
-    std::string icon = "input-keyboard";
     std::string label;
     std::string description = _("Not available");
+    std::string altDescription = "";
+    std::string icon = "input-keyboard";
     if (ic) {
-        const auto *entry = instance_->inputMethodEntry(ic);
-        if (entry) {
-            icon = entry->icon();
+        icon = instance_->inputMethodIcon(ic);
+        if (auto entry = instance_->inputMethodEntry(ic)) {
             label = entry->label();
+            if (auto engine = instance_->inputMethodEngine(ic)) {
+                auto subModeLabel = engine->subModeLabel(*entry, *ic);
+                if (!subModeLabel.empty()) {
+                    label = subModeLabel;
+                }
+                altDescription = engine->subMode(*entry, *ic);
+            }
             description = entry->name();
         }
     }
@@ -377,9 +383,8 @@ std::string Kimpanel::inputMethodStatus(InputContext *ic) {
         icon = "input-keyboard-symbolic";
     }
 
-    return stringutils::concat(
-        "/Fcitx/im:", label.empty() ? description : label, ":", icon, ":",
-        label.empty() ? "" : description, ":menu");
+    return stringutils::concat("/Fcitx/im:", description, ":", iconName(icon),
+                               ":", altDescription, ":menu,label=", label);
 }
 
 void Kimpanel::updateCurrentInputMethod(InputContext *ic) {
@@ -413,7 +418,7 @@ void Kimpanel::msgV1Handler(dbus::Message &msg) {
                 }
                 menuitems.push_back(stringutils::concat(
                     "/Fcitx/im/", entry->uniqueName(), ":", entry->name(), ":",
-                    entry->icon(), "::"));
+                    iconName(entry->icon()), "::"));
             }
             proxy_->execMenu(menuitems);
         } else if (stringutils::startsWith(property, "/Fcitx/im/")) {

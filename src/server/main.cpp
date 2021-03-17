@@ -12,23 +12,33 @@
 #include <iostream>
 #include <libintl.h>
 #include "fcitx-utils/fs.h"
+#include "fcitx-utils/misc_p.h"
 #include "fcitx-utils/standardpath.h"
 #include "fcitx/addonfactory.h"
 #include "fcitx/addonmanager.h"
 #include "fcitx/instance.h"
 #include "errorhandler.h"
+
+#ifdef ENABLE_KEYBOARD
 #include "keyboard.h"
+#endif
 
 using namespace fcitx;
 int selfpipe[2];
 std::string crashlog;
 
+#ifdef ENABLE_KEYBOARD
 static KeyboardEngineFactory keyboardFactory;
+#endif
+
 StaticAddonRegistry staticAddon = {
-    std::make_pair<std::string, AddonFactory *>("keyboard", &keyboardFactory)};
+#ifdef ENABLE_KEYBOARD
+    std::make_pair<std::string, AddonFactory *>("keyboard", &keyboardFactory)
+#endif
+};
 
 int main(int argc, char *argv[]) {
-    if (pipe2(selfpipe, O_CLOEXEC | O_NONBLOCK) < 0) {
+    if (safePipe(selfpipe) < 0) {
         fprintf(stderr, "Could not create self-pipe.\n");
         return 1;
     }

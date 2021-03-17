@@ -11,9 +11,11 @@
 #include "fcitx-utils/charutils.h"
 #include "fcitx-utils/dbus/message.h"
 #include "fcitx-utils/dbus/objectvtable.h"
+#include "fcitx-utils/fs.h"
 #include "fcitx-utils/i18n.h"
 #include "fcitx/addonfactory.h"
 #include "fcitx/addonmanager.h"
+#include "fcitx/inputmethodengine.h"
 #include "fcitx/inputmethodentry.h"
 #include "dbusmenu.h"
 
@@ -25,9 +27,22 @@
 
 namespace fcitx {
 
+namespace {
+bool isKDE() {
+    std::string_view desktop;
+    auto *desktopEnv = getenv("XDG_CURRENT_DESKTOP");
+    if (desktopEnv) {
+        desktop = desktopEnv;
+    }
+    return (desktop == "KDE");
+}
+} // namespace
+
 class StatusNotifierItem : public dbus::ObjectVTable<StatusNotifierItem> {
 public:
-    StatusNotifierItem(NotificationItem *parent) : parent_(parent) {}
+    StatusNotifierItem(NotificationItem *parent) : parent_(parent) {
+        FCITX_LOG_IF(Info, inFlatpak_) << "Running inside flatpak.";
+    }
 
     void scroll(int delta, const std::string &_orientation) {
         std::string orientation = _orientation;
@@ -49,19 +64,26 @@ public:
     void activate(int, int) { parent_->instance()->toggle(); }
     void secondaryActivate(int, int) {}
     std::string iconName() {
-        std::string icon = "input-keyboard-symbolic";
-        if (auto *ic = parent_->instance()->lastFocusedInputContext()) {
-            if (const auto *entry = parent_->instance()->inputMethodEntry(ic)) {
-                icon = entry->icon();
-            }
+        static bool preferSymbolic = !isKDE();
+        std::string icon;
+        if (preferSymbolic) {
+            icon = "input-keyboard-symbolic";
+        } else {
+            icon = "input-keyboard";
         }
-        if (icon == "input-keyboard") {
+        if (auto *ic = parent_->instance()->lastFocusedInputContext()) {
+            icon = parent_->instance()->inputMethodIcon(ic);
+        }
+        if (icon == "input-keyboard" && preferSymbolic) {
             return "input-keyboard-symbolic";
         }
-        return icon;
+        return IconTheme::iconName(icon, inFlatpak_);
     }
 
     std::string label() {
+        if (!parent_->config().showLabel.value()) {
+            return "";
+        }
         if (auto *ic = parent_->instance()->lastFocusedInputContext()) {
             if (const auto *entry = parent_->instance()->inputMethodEntry(ic)) {
                 if (entry->isKeyboard() || entry->icon().empty()) {
@@ -92,23 +114,45 @@ public:
     FCITX_OBJECT_VTABLE_SIGNAL(newTitle, "NewTitle", "");
     FCITX_OBJECT_VTABLE_SIGNAL(xayatanaNewLabel, "XAyatanaNewLabel", "ss");
 
-    FCITX_OBJECT_VTABLE_PROPERTY(id, "Id", "s", []() { return "Fcitx"; });
     FCITX_OBJECT_VTABLE_PROPERTY(category, "Category", "s",
                                  []() { return "SystemServices"; });
-    FCITX_OBJECT_VTABLE_PROPERTY(status, "Status", "s",
-                                 []() { return "Active"; });
-    FCITX_OBJECT_VTABLE_PROPERTY(iconName, "IconName", "s",
-                                 [this]() { return iconName(); });
-    FCITX_OBJECT_VTABLE_PROPERTY(attentionIconName, "AttentionIconName", "s",
-                                 []() { return ""; });
+    FCITX_OBJECT_VTABLE_PROPERTY(id, "Id", "s", []() { return "Fcitx"; });
     FCITX_OBJECT_VTABLE_PROPERTY(title, "Title", "s",
                                  []() { return _("Input Method"); });
+    FCITX_OBJECT_VTABLE_PROPERTY(status, "Status", "s",
+                                 []() { return "Active"; });
+    FCITX_OBJECT_VTABLE_PROPERTY(windowId, "WindowId", "u", []() { return 0; });
+    FCITX_OBJECT_VTABLE_PROPERTY(iconName, "IconName", "s",
+                                 [this]() { return iconName(); });
+    FCITX_OBJECT_VTABLE_PROPERTY(
+        iconPixmap, "IconPixmap", "a(iiay)", ([]() {
+            return std::vector<
+                dbus::DBusStruct<int, int, std::vector<uint8_t>>>{};
+        }));
+    FCITX_OBJECT_VTABLE_PROPERTY(overlayIconName, "OverlayIconName", "s",
+                                 ([]() { return ""; }));
+    FCITX_OBJECT_VTABLE_PROPERTY(
+        overlayIconPixmap, "OverlayIconPixmap", "a(iiay)", ([]() {
+            return std::vector<
+                dbus::DBusStruct<int, int, std::vector<uint8_t>>>{};
+        }));
+    FCITX_OBJECT_VTABLE_PROPERTY(attentionIconName, "AttentionIconName", "s",
+                                 []() { return ""; });
+    FCITX_OBJECT_VTABLE_PROPERTY(
+        attentionIconPixmap, "AttentionIconPixmap", "a(iiay)", ([]() {
+            return std::vector<
+                dbus::DBusStruct<int, int, std::vector<uint8_t>>>{};
+        }));
+    FCITX_OBJECT_VTABLE_PROPERTY(attentionMovieName, "AttentionMovieName", "s",
+                                 []() { return ""; });
     FCITX_OBJECT_VTABLE_PROPERTY(tooltip, "ToolTip", "(sa(iiay)ss)",
                                  []() { return tooltip(); });
-    FCITX_OBJECT_VTABLE_PROPERTY(iconThemePath, "IconThemePath", "s",
-                                 []() { return ""; });
+    FCITX_OBJECT_VTABLE_PROPERTY(itemIsMenu, "ItemIsMenu", "b",
+                                 []() { return false; });
     FCITX_OBJECT_VTABLE_PROPERTY(menu, "Menu", "o",
                                  []() { return dbus::ObjectPath("/MenuBar"); });
+    FCITX_OBJECT_VTABLE_PROPERTY(iconThemePath, "IconThemePath", "s",
+                                 []() { return ""; });
     FCITX_OBJECT_VTABLE_PROPERTY(xayatanaLabel, "XAyatanaLabel", "s",
                                  [this]() { return label(); });
     FCITX_OBJECT_VTABLE_PROPERTY(XAyatanaLabelGuide, "XAyatanaLabelGuide", "s",
@@ -120,6 +164,7 @@ public:
 private:
     NotificationItem *parent_;
     int deltaAcc_ = 0;
+    const bool inFlatpak_ = fs::isreg("/.flatpak-info");
 };
 
 NotificationItem::NotificationItem(Instance *instance)
@@ -127,6 +172,7 @@ NotificationItem::NotificationItem(Instance *instance)
       watcher_(std::make_unique<dbus::ServiceWatcher>(*bus_)),
       sni_(std::make_unique<StatusNotifierItem>(this)),
       menu_(std::make_unique<DBusMenu>(this)) {
+    reloadConfig();
     watcherEntry_ = watcher_->watchService(
         NOTIFICATION_WATCHER_DBUS_ADDR,
         [this](const std::string &, const std::string &,
@@ -136,6 +182,10 @@ NotificationItem::NotificationItem(Instance *instance)
 NotificationItem::~NotificationItem() = default;
 
 dbus::Bus *NotificationItem::bus() { return dbus()->call<IDBusModule::bus>(); }
+
+void NotificationItem::reloadConfig() {
+    readAsIni(config_, "conf/notificationitem.conf");
+}
 
 void NotificationItem::setSerivceName(const std::string &newName) {
     sniWatcherName_ = newName;
@@ -184,8 +234,8 @@ void NotificationItem::enable() {
     bus_->addObjectVTable(NOTIFICATION_ITEM_DEFAULT_OBJ,
                           NOTIFICATION_ITEM_DBUS_IFACE, *sni_);
 
-    serviceName_ =
-        fmt::format("org.kde.StatusNotifierItem-{0}-{1}", getpid(), ++index_);
+    serviceName_ = fmt::format("org.fcitx.Fcitx5.StatusNotifierItem-{0}-{1}",
+                               getpid(), ++index_);
     if (!bus_->requestName(serviceName_, Flags<dbus::RequestNameFlag>(0))) {
         return;
     }
@@ -199,6 +249,14 @@ void NotificationItem::enable() {
         eventHandlers_.emplace_back(instance_->watchEvent(
             type, EventWatcherPhase::Default, updateIcon));
     }
+    eventHandlers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextUpdateUI, EventWatcherPhase::Default,
+        [this](Event &event) {
+            if (static_cast<InputContextUpdateUIEvent &>(event).component() ==
+                UserInterfaceComponent::StatusArea) {
+                newIcon();
+            }
+        }));
 }
 
 void NotificationItem::disable() {

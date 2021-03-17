@@ -12,8 +12,10 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <gio/gunixinputstream.h>
 #include <pango/pangocairo.h>
+#include "fcitx-config/iniparser.h"
 #include "fcitx-utils/fs.h"
 #include "fcitx-utils/log.h"
+#include "fcitx-utils/rect.h"
 #include "fcitx-utils/standardpath.h"
 #include "fcitx/misc_p.h"
 #include "common.h"
@@ -222,18 +224,57 @@ ThemeImage::ThemeImage(const std::string &name,
         valid_ = image_ != nullptr;
     }
 
+    if (!cfg.overlay->empty()) {
+        auto imageFile = StandardPath::global().open(
+            StandardPath::Type::PkgData,
+            fmt::format("themes/{0}/{1}", name, *cfg.overlay), O_RDONLY);
+        overlay_.reset(loadImage(imageFile));
+        if (overlay_ &&
+            cairo_surface_status(overlay_.get()) != CAIRO_STATUS_SUCCESS) {
+            overlay_.reset();
+        }
+    }
+
     if (!image_) {
         auto width = *cfg.margin->marginLeft + *cfg.margin->marginRight + 1;
         auto height = *cfg.margin->marginTop + *cfg.margin->marginBottom + 1;
 
-        CLASSICUI_DEBUG() << "height" << height << "width" << width;
+        auto borderWidth =
+            std::min({*cfg.borderWidth, *cfg.margin->marginLeft,
+                      *cfg.margin->marginRight, *cfg.margin->marginTop,
+                      *cfg.margin->marginBottom});
+
+        CLASSICUI_DEBUG() << "Paint background: height " << height << " width "
+                          << width;
         image_.reset(
             cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height));
         auto *cr = cairo_create(image_.get());
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        if (borderWidth) {
+            cairoSetSourceColor(cr, *cfg.borderColor);
+            cairo_paint(cr);
+        }
+
+        cairo_rectangle(cr, borderWidth, borderWidth, width - borderWidth * 2,
+                        height - borderWidth * 2);
+        cairo_clip(cr);
         cairoSetSourceColor(cr, *cfg.color);
         cairo_paint(cr);
         cairo_destroy(cr);
+    }
+}
+
+ThemeImage::ThemeImage(const std::string &name, const ActionImageConfig &cfg) {
+    if (!cfg.image->empty()) {
+        auto imageFile = StandardPath::global().open(
+            StandardPath::Type::PkgData,
+            fmt::format("themes/{0}/{1}", name, *cfg.image), O_RDONLY);
+        image_.reset(loadImage(imageFile));
+        if (image_ &&
+            cairo_surface_status(image_.get()) != CAIRO_STATUS_SUCCESS) {
+            image_.reset();
+        }
+        valid_ = image_ != nullptr;
     }
 }
 
@@ -249,6 +290,18 @@ const ThemeImage &Theme::loadBackground(const BackgroundImageConfig &cfg) {
     auto result = backgroundImageTable_.emplace(
         std::piecewise_construct, std::forward_as_tuple(&cfg),
         std::forward_as_tuple(name_, cfg));
+    assert(result.second);
+    return result.first->second;
+}
+
+const ThemeImage &Theme::loadAction(const ActionImageConfig &cfg) {
+    if (auto *image = findValue(actionImageTable_, &cfg)) {
+        return *image;
+    }
+
+    auto result = actionImageTable_.emplace(std::piecewise_construct,
+                                            std::forward_as_tuple(&cfg),
+                                            std::forward_as_tuple(name_, cfg));
     assert(result.second);
     return result.first->second;
 }
@@ -416,44 +469,151 @@ void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int width,
 
     /* part 5 */
     {
-        int repaintH = 0, repaintV = 0;
         double scaleX = 1.0, scaleY = 1.0;
-
-        repaintH = 1;
         scaleX =
             (double)(width - marginLeft - marginRight) / (double)resizeWidth;
 
-        repaintV = 1;
         scaleY =
             (double)(height - marginTop - marginBottom) / (double)resizeHeight;
 
-        int i, j;
-        for (i = 0; i < repaintH; i++) {
-            for (j = 0; j < repaintV; j++) {
-                cairo_save(c);
-                cairo_translate(c, marginLeft + i * resizeWidth,
-                                marginTop + j * resizeHeight);
-                cairo_scale(c, scaleX, scaleY);
-                cairo_set_source_surface(c, image, -marginLeft, -marginTop);
-                cairo_pattern_set_filter(cairo_get_source(c),
-                                         CAIRO_FILTER_NEAREST);
-                int w = resizeWidth, h = resizeHeight;
+        cairo_save(c);
+        cairo_translate(c, marginLeft, marginTop);
+        cairo_scale(c, scaleX, scaleY);
+        cairo_set_source_surface(c, image, -marginLeft, -marginTop);
+        cairo_pattern_set_filter(cairo_get_source(c), CAIRO_FILTER_NEAREST);
+        int w = resizeWidth, h = resizeHeight;
 
-                cairo_rectangle(c, 0, 0, w, h);
-                cairo_clip(c);
-                cairo_paint_with_alpha(c, alpha);
-                cairo_restore(c);
-            }
-        }
+        cairo_rectangle(c, 0, 0, w, h);
+        cairo_clip(c);
+        cairo_paint_with_alpha(c, alpha);
+        cairo_restore(c);
     }
+    cairo_restore(c);
+
+    if (!image.overlay()) {
+        return;
+    }
+
+    Rect clipRect;
+    auto clipWidth = width - *cfg.overlayClipMargin->marginLeft -
+                     *cfg.overlayClipMargin->marginRight;
+    auto clipHeight = height - *cfg.overlayClipMargin->marginTop -
+                      *cfg.overlayClipMargin->marginBottom;
+    if (clipWidth <= 0 || clipHeight <= 0) {
+        return;
+    }
+    clipRect
+        .setPosition(*cfg.overlayClipMargin->marginLeft,
+                     *cfg.overlayClipMargin->marginTop)
+        .setSize(clipWidth, clipHeight);
+
+    int x = 0, y = 0;
+    switch (*cfg.gravity) {
+    case Gravity::TopLeft:
+    case Gravity::CenterLeft:
+    case Gravity::BottomLeft:
+        x = *cfg.overlayOffsetX;
+        break;
+    case Gravity::TopCenter:
+    case Gravity::Center:
+    case Gravity::BottomCenter:
+        x = (width - image.overlayWidth()) / 2 + *cfg.overlayOffsetX;
+        break;
+    case Gravity::TopRight:
+    case Gravity::CenterRight:
+    case Gravity::BottomRight:
+        x = width - image.overlayWidth() - *cfg.overlayOffsetX;
+        break;
+    }
+    switch (*cfg.gravity) {
+    case Gravity::TopLeft:
+    case Gravity::TopCenter:
+    case Gravity::TopRight:
+        y = *cfg.overlayOffsetY;
+        break;
+    case Gravity::CenterLeft:
+    case Gravity::Center:
+    case Gravity::CenterRight:
+        y = (height - image.overlayHeight()) / 2 + *cfg.overlayOffsetY;
+        break;
+    case Gravity::BottomLeft:
+    case Gravity::BottomCenter:
+    case Gravity::BottomRight:
+        y = height - image.overlayHeight() - *cfg.overlayOffsetY;
+        break;
+    }
+    Rect rect;
+    rect.setPosition(x, y).setSize(image.overlayWidth(), image.overlayHeight());
+    Rect finalRect = rect.intersected(clipRect);
+    if (finalRect.isEmpty()) {
+        return;
+    }
+
+    if (*cfg.hideOverlayIfOversize && !clipRect.contains(rect)) {
+        return;
+    }
+
+    cairo_save(c);
+    cairo_set_operator(c, CAIRO_OPERATOR_OVER);
+    cairo_translate(c, finalRect.left(), finalRect.top());
+    cairo_set_source_surface(c, image.overlay(), x - finalRect.left(),
+                             y - finalRect.top());
+    cairo_rectangle(c, 0, 0, finalRect.width(), finalRect.height());
+    cairo_clip(c);
+    cairo_paint_with_alpha(c, alpha);
     cairo_restore(c);
 }
 
-void Theme::load(const std::string &name, const RawConfig &rawConfig) {
+void Theme::paint(cairo_t *c, const ActionImageConfig &cfg, double alpha) {
+    const ThemeImage &image = loadAction(cfg);
+    int height = cairo_image_surface_get_height(image);
+    int width = cairo_image_surface_get_width(image);
+
+    cairo_save(c);
+    cairo_set_source_surface(c, image, 0, 0);
+    cairo_rectangle(c, 0, 0, width, height);
+    cairo_clip(c);
+    cairo_paint_with_alpha(c, alpha);
+    cairo_restore(c);
+}
+
+void Theme::reset() {
     imageTable_.clear();
     trayImageTable_.clear();
     backgroundImageTable_.clear();
-    Configuration::load(rawConfig);
+    actionImageTable_.clear();
+}
+
+void Theme::load(const std::string &name) {
+    reset();
+    if (auto themeConfigFile = StandardPath::global().openSystem(
+            StandardPath::Type::PkgData,
+            stringutils::joinPath("themes", name, "theme.conf"), O_RDONLY);
+        themeConfigFile.isValid()) {
+        RawConfig themeConfig;
+        readFromIni(themeConfig, themeConfigFile.fd());
+        Configuration::load(themeConfig, true);
+    } else {
+        // No sys file, reset default value.
+        ThemeConfig config;
+        copyHelper(config);
+    }
+    syncDefaultValueToCurrent();
+    if (auto themeConfigFile = StandardPath::global().openUser(
+            StandardPath::Type::PkgData,
+            stringutils::joinPath("themes", name, "theme.conf"), O_RDONLY);
+        themeConfigFile.isValid()) {
+        // Has user file, load user file data.
+        RawConfig themeConfig;
+        readFromIni(themeConfig, themeConfigFile.fd());
+        Configuration::load(themeConfig, true);
+    }
+    name_ = name;
+}
+
+void Theme::load(const std::string &name, const RawConfig &rawConfig) {
+    reset();
+    Configuration::load(rawConfig, true);
     name_ = name;
 }
 

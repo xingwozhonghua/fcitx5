@@ -11,6 +11,7 @@
 #include <pango/pangocairo.h>
 #include "fcitx-utils/color.h"
 #include "fcitx-utils/log.h"
+#include "fcitx/inputmethodentry.h"
 #include "fcitx/inputpanel.h"
 #include "fcitx/instance.h"
 #include "fcitx/misc_p.h"
@@ -18,24 +19,67 @@
 
 namespace fcitx::classicui {
 
-void shrink(Rect &rect, const MarginConfig &margin) {
-    int newWidth = rect.width() - *margin.marginLeft - *margin.marginRight;
-    int newHeight = rect.height() - *margin.marginTop - *margin.marginBottom;
-    if (newWidth < 0) {
-        newWidth = 0;
-    }
-    if (newHeight < 0) {
-        newHeight = 0;
-    }
-    rect.setPosition(rect.left() + *margin.marginLeft,
-                     rect.top() + *margin.marginTop);
-    rect.setSize(newWidth, newHeight);
-}
-
 auto newPangoLayout(PangoContext *context) {
     GObjectUniquePtr<PangoLayout> ptr(pango_layout_new(context));
-    pango_layout_set_single_paragraph_mode(ptr.get(), true);
+    pango_layout_set_single_paragraph_mode(ptr.get(), false);
     return ptr;
+}
+
+static void prepareLayout(cairo_t *cr, PangoLayout *layout) {
+    const PangoMatrix *matrix;
+
+    matrix = pango_context_get_matrix(pango_layout_get_context(layout));
+
+    if (matrix) {
+        cairo_matrix_t cairo_matrix;
+
+        cairo_matrix_init(&cairo_matrix, matrix->xx, matrix->yx, matrix->xy,
+                          matrix->yy, matrix->x0, matrix->y0);
+
+        cairo_transform(cr, &cairo_matrix);
+    }
+}
+
+static void renderLayout(cairo_t *cr, PangoLayout *layout, int x, int y) {
+    auto context = pango_layout_get_context(layout);
+    auto *metrics = pango_context_get_metrics(
+        context, pango_context_get_font_description(context),
+        pango_context_get_language(context));
+    auto ascent = pango_font_metrics_get_ascent(metrics);
+    pango_font_metrics_unref(metrics);
+    auto baseline = pango_layout_get_baseline(layout);
+    auto yOffset = PANGO_PIXELS(ascent - baseline);
+    cairo_save(cr);
+
+    cairo_move_to(cr, x, y + yOffset);
+    prepareLayout(cr, layout);
+    pango_cairo_show_layout(cr, layout);
+
+    cairo_restore(cr);
+}
+
+int MultilineLayout::width() const {
+    int width = 0;
+    for (const auto &layout : lines_) {
+        int w, h;
+        pango_layout_get_pixel_size(layout.get(), &w, &h);
+        width = std::max(width, w);
+    }
+    return width;
+}
+
+void MultilineLayout::render(cairo_t *cr, int x, int y, int lineHeight,
+                             bool highlight) {
+    for (size_t i = 0; i < lines_.size(); i++) {
+        if (highlight) {
+            pango_layout_set_attributes(lines_[i].get(),
+                                        highlightAttrLists_[i].get());
+        } else {
+            pango_layout_set_attributes(lines_[i].get(), attrLists_[i].get());
+        }
+        renderLayout(cr, lines_[i].get(), x, y);
+        y += lineHeight;
+    }
 }
 
 InputWindow::InputWindow(ClassicUI *parent) : parent_(parent) {
@@ -76,22 +120,37 @@ void InputWindow::insertAttr(PangoAttrList *attrList, TextFormatFlags format,
             ? *parent_->theme().inputPanel->highlightColor
             : (highlight ? *parent_->theme().inputPanel->highlightCandidateColor
                          : *parent_->theme().inputPanel->normalColor);
-    auto scale = std::numeric_limits<unsigned short>::max();
+    const auto scale = std::numeric_limits<uint16_t>::max();
     auto *attr = pango_attr_foreground_new(
         color.redF() * scale, color.greenF() * scale, color.blueF() * scale);
     attr->start_index = start;
     attr->end_index = end;
     pango_attr_list_insert(attrList, attr);
 
-    if (format & TextFormatFlag::HighLight) {
-        auto background =
-            *parent_->theme().inputPanel->highlightBackgroundColor;
+    if (color.alpha() != 255) {
+        auto *alphaAttr =
+            pango_attr_foreground_alpha_new(color.alphaF() * scale);
+        alphaAttr->start_index = start;
+        alphaAttr->end_index = end;
+        pango_attr_list_insert(attrList, alphaAttr);
+    }
+
+    auto background = *parent_->theme().inputPanel->highlightBackgroundColor;
+    if (format.test(TextFormatFlag::HighLight) && background.alpha() > 0) {
         attr = pango_attr_background_new(background.redF() * scale,
                                          background.greenF() * scale,
                                          background.blueF() * scale);
         attr->start_index = start;
         attr->end_index = end;
         pango_attr_list_insert(attrList, attr);
+
+        if (background.alpha() != 255) {
+            auto *alphaAttr =
+                pango_attr_background_alpha_new(background.alphaF() * scale);
+            alphaAttr->start_index = start;
+            alphaAttr->end_index = end;
+            pango_attr_list_insert(attrList, alphaAttr);
+        }
     }
 }
 
@@ -115,26 +174,36 @@ void InputWindow::appendText(std::string &s, PangoAttrList *attrList,
 
 void InputWindow::resizeCandidates(size_t n) {
     while (labelLayouts_.size() < n) {
-        labelLayouts_.emplace_back(newPangoLayout(context_.get()));
+        labelLayouts_.emplace_back();
     }
     while (candidateLayouts_.size() < n) {
-        candidateLayouts_.emplace_back(newPangoLayout(context_.get()));
-    }
-    for (auto *attrLists :
-         {&labelAttrLists_, &candidateAttrLists_, &highlightLabelAttrLists_,
-          &highlightCandidateAttrLists_}) {
-        while (attrLists->size() < n) {
-            attrLists->emplace_back(pango_attr_list_new());
-        }
+        candidateLayouts_.emplace_back();
     }
 
     nCandidates_ = n;
 }
 
-void InputWindow::setTextToLayout(
-    PangoLayout *layout, PangoAttrListUniquePtr *attrList,
-    PangoAttrListUniquePtr *highlightAttrList,
+void InputWindow::setTextToMultilineLayout(InputContext *inputContext,
+                                           MultilineLayout &layout,
+                                           const Text &text) {
+    auto lines = text.splitByLine();
+    layout.lines_.clear();
+    layout.attrLists_.clear();
+    layout.highlightAttrLists_.clear();
 
+    for (const auto &line : lines) {
+        layout.lines_.emplace_back(pango_layout_new(context_.get()));
+        layout.attrLists_.emplace_back();
+        layout.highlightAttrLists_.emplace_back();
+        setTextToLayout(inputContext, layout.lines_.back().get(),
+                        &layout.attrLists_.back(),
+                        &layout.highlightAttrLists_.back(), {line});
+    }
+}
+
+void InputWindow::setTextToLayout(
+    InputContext *inputContext, PangoLayout *layout,
+    PangoAttrListUniquePtr *attrList, PangoAttrListUniquePtr *highlightAttrList,
     std::initializer_list<std::reference_wrapper<const Text>> texts) {
     auto *newAttrList = pango_attr_list_new();
     if (attrList) {
@@ -151,6 +220,26 @@ void InputWindow::setTextToLayout(
     std::string line;
     for (const auto &text : texts) {
         appendText(line, newAttrList, newHighlightAttrList, text);
+    }
+
+    auto entry = parent_->instance()->inputMethodEntry(inputContext);
+    if (*parent_->config().useInputMethodLanguageToDisplayText && entry &&
+        !entry->languageCode().empty()) {
+        if (auto language =
+                pango_language_from_string(entry->languageCode().c_str())) {
+            if (newAttrList) {
+                auto attr = pango_attr_language_new(language);
+                attr->start_index = 0;
+                attr->end_index = line.size();
+                pango_attr_list_insert(newAttrList, attr);
+            }
+            if (newHighlightAttrList) {
+                auto attr = pango_attr_language_new(language);
+                attr->start_index = 0;
+                attr->end_index = line.size();
+                pango_attr_list_insert(newHighlightAttrList, attr);
+            }
+        }
     }
 
     pango_layout_set_text(layout, line.c_str(), line.size());
@@ -180,14 +269,16 @@ void InputWindow::update(InputContext *inputContext) {
     auto preedit = instance->outputFilter(inputContext, inputPanel.preedit());
     auto auxUp = instance->outputFilter(inputContext, inputPanel.auxUp());
     pango_layout_set_single_paragraph_mode(upperLayout_.get(), true);
-    setTextToLayout(upperLayout_.get(), nullptr, nullptr, {auxUp, preedit});
+    setTextToLayout(inputContext, upperLayout_.get(), nullptr, nullptr,
+                    {auxUp, preedit});
     if (preedit.cursor() >= 0 &&
         static_cast<size_t>(preedit.cursor()) <= preedit.textLength()) {
         cursor_ = preedit.cursor() + auxUp.toString().size();
     }
 
     auto auxDown = instance->outputFilter(inputContext, inputPanel.auxDown());
-    setTextToLayout(lowerLayout_.get(), nullptr, nullptr, {auxDown});
+    setTextToLayout(inputContext, lowerLayout_.get(), nullptr, nullptr,
+                    {auxDown});
 
     if (auto candidateList = inputPanel.candidateList()) {
         // Count non-placeholder candidates.
@@ -220,15 +311,12 @@ void InputWindow::update(InputContext *inputContext) {
                                  : candidateList->label(i);
 
             labelText = instance->outputFilter(inputContext, labelText);
-            setTextToLayout(labelLayouts_[localIndex].get(),
-                            &labelAttrLists_[localIndex],
-                            &highlightLabelAttrLists_[localIndex], {labelText});
+            setTextToMultilineLayout(inputContext, labelLayouts_[localIndex],
+                                     labelText);
             auto candidateText =
                 instance->outputFilter(inputContext, candidate.text());
-            setTextToLayout(candidateLayouts_[localIndex].get(),
-                            &candidateAttrLists_[localIndex],
-                            &highlightCandidateAttrLists_[localIndex],
-                            {candidateText});
+            setTextToMultilineLayout(
+                inputContext, candidateLayouts_[localIndex], candidateText);
             localIndex++;
         }
 
@@ -262,15 +350,16 @@ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
     pango_layout_context_changed(upperLayout_.get());
     pango_layout_context_changed(lowerLayout_.get());
     for (size_t i = 0; i < nCandidates_; i++) {
-        pango_layout_context_changed(labelLayouts_[i].get());
-        pango_layout_context_changed(candidateLayouts_[i].get());
+        labelLayouts_[i].contextChanged();
+        candidateLayouts_[i].contextChanged();
     }
     auto *metrics = pango_context_get_metrics(
         context_.get(), pango_context_get_font_description(context_.get()),
         pango_context_get_language(context_.get()));
-    auto minH = pango_font_metrics_get_ascent(metrics) +
-                pango_font_metrics_get_descent(metrics);
+    auto fontHeight = pango_font_metrics_get_ascent(metrics) +
+                      pango_font_metrics_get_descent(metrics);
     pango_font_metrics_unref(metrics);
+    fontHeight = PANGO_PIXELS(fontHeight);
 
     size_t width = 0;
     size_t height = 0;
@@ -286,13 +375,12 @@ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
     auto extraH = *textMargin.marginTop + *textMargin.marginBottom;
     if (pango_layout_get_character_count(upperLayout_.get())) {
         pango_layout_get_pixel_size(upperLayout_.get(), &w, &h);
-        h = std::max(PANGO_PIXELS_FLOOR(minH), h);
-        height += h + extraH;
+        height += fontHeight + extraH;
         updateIfLarger(width, w + extraW);
     }
     if (pango_layout_get_character_count(lowerLayout_.get())) {
         pango_layout_get_pixel_size(lowerLayout_.get(), &w, &h);
-        height += h + extraH;
+        height += fontHeight + extraH;
         updateIfLarger(width, w + extraW);
     }
 
@@ -306,15 +394,17 @@ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
     size_t wholeH = 0, wholeW = 0;
     for (size_t i = 0; i < nCandidates_; i++) {
         size_t candidateW = 0, candidateH = 0;
-        if (pango_layout_get_character_count(labelLayouts_[i].get())) {
-            pango_layout_get_pixel_size(labelLayouts_[i].get(), &w, &h);
-            candidateW += w;
-            updateIfLarger(candidateH, h + extraH);
+        if (labelLayouts_[i].characterCount()) {
+            candidateW += labelLayouts_[i].width();
+            updateIfLarger(candidateH,
+                           std::max(1, labelLayouts_[i].size()) * fontHeight +
+                               extraH);
         }
-        if (pango_layout_get_character_count(candidateLayouts_[i].get())) {
-            pango_layout_get_pixel_size(candidateLayouts_[i].get(), &w, &h);
-            candidateW += w;
-            updateIfLarger(candidateH, h + extraH);
+        if (candidateLayouts_[i].characterCount()) {
+            candidateW += candidateLayouts_[i].width();
+            updateIfLarger(
+                candidateH,
+                std::max(1, candidateLayouts_[i].size()) * fontHeight + extraH);
         }
         candidateW += extraW;
 
@@ -334,37 +424,14 @@ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
     height += *margin.marginTop + *margin.marginBottom;
 
     if (nCandidates_ && (hasPrev_ || hasNext_)) {
-        const auto &prev = theme.loadBackground(*theme.inputPanel->prev);
-        const auto &next = theme.loadBackground(*theme.inputPanel->next);
+        const auto &prev = theme.loadAction(*theme.inputPanel->prev);
+        const auto &next = theme.loadAction(*theme.inputPanel->next);
         if (prev.valid() && next.valid()) {
             width += prev.width() + next.width();
         }
     }
 
     return {width, height};
-}
-
-static void prepareLayout(cairo_t *cr, PangoLayout *layout) {
-    const PangoMatrix *matrix;
-
-    matrix = pango_context_get_matrix(pango_layout_get_context(layout));
-
-    if (matrix) {
-        cairo_matrix_t cairo_matrix;
-
-        cairo_matrix_init(&cairo_matrix, matrix->xx, matrix->yx, matrix->xy,
-                          matrix->yy, matrix->x0, matrix->y0);
-
-        cairo_transform(cr, &cairo_matrix);
-    }
-}
-
-static void renderLayout(cairo_t *cr, PangoLayout *layout) {
-    cairo_save(cr);
-    prepareLayout(cr, layout);
-    pango_cairo_show_layout(cr, layout);
-
-    cairo_restore(cr);
 }
 
 void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
@@ -379,8 +446,8 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
     prevRegion_ = Rect();
     nextRegion_ = Rect();
     if (nCandidates_ && (hasPrev_ || hasNext_)) {
-        const auto &prev = theme.loadBackground(*theme.inputPanel->prev);
-        const auto &next = theme.loadBackground(*theme.inputPanel->next);
+        const auto &prev = theme.loadAction(*theme.inputPanel->prev);
+        const auto &next = theme.loadAction(*theme.inputPanel->next);
         if (prev.valid() && next.valid()) {
             cairo_save(cr);
             nextRegion_.setPosition(width - *margin.marginRight - next.width(),
@@ -395,7 +462,7 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
             } else if (nextHovered_) {
                 alpha = 0.7;
             }
-            theme.paint(cr, *theme.inputPanel->next, -1, -1, alpha);
+            theme.paint(cr, *theme.inputPanel->next, alpha);
             cairo_restore(cr);
             cairo_save(cr);
             prevRegion_.setPosition(
@@ -410,7 +477,7 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
             } else if (prevHovered_) {
                 alpha = 0.7;
             }
-            theme.paint(cr, *theme.inputPanel->prev, -1, -1, alpha);
+            theme.paint(cr, *theme.inputPanel->prev, alpha);
             cairo_restore(cr);
         }
     }
@@ -424,19 +491,19 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
     auto *metrics = pango_context_get_metrics(
         context_.get(), pango_context_get_font_description(context_.get()),
         pango_context_get_language(context_.get()));
-    auto minH = pango_font_metrics_get_ascent(metrics) +
-                pango_font_metrics_get_descent(metrics);
+    auto fontHeight = pango_font_metrics_get_ascent(metrics) +
+                      pango_font_metrics_get_descent(metrics);
     pango_font_metrics_unref(metrics);
+    fontHeight = PANGO_PIXELS(fontHeight);
 
     size_t currentHeight = 0;
     int w, h;
     auto extraW = *textMargin.marginLeft + *textMargin.marginRight;
     auto extraH = *textMargin.marginTop + *textMargin.marginBottom;
     if (pango_layout_get_character_count(upperLayout_.get())) {
-        cairo_move_to(cr, *textMargin.marginLeft, *textMargin.marginTop);
-        renderLayout(cr, upperLayout_.get());
+        renderLayout(cr, upperLayout_.get(), *textMargin.marginLeft,
+                     *textMargin.marginTop);
         pango_layout_get_pixel_size(upperLayout_.get(), &w, &h);
-        h = std::max(PANGO_PIXELS_FLOOR(minH), h);
         PangoRectangle pos;
         if (cursor_ >= 0) {
             pango_layout_get_cursor_pos(upperLayout_.get(), cursor_, &pos,
@@ -448,18 +515,17 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
             cairo_move_to(cr, *textMargin.marginLeft + offsetX + 1,
                           *textMargin.marginTop);
             cairo_line_to(cr, *textMargin.marginLeft + offsetX + 1,
-                          *textMargin.marginTop + h);
+                          *textMargin.marginTop + fontHeight);
             cairo_stroke(cr);
             cairo_restore(cr);
         }
-        currentHeight += h + extraH;
+        currentHeight += fontHeight + extraH;
     }
     if (pango_layout_get_character_count(lowerLayout_.get())) {
-        cairo_move_to(cr, *textMargin.marginLeft,
-                      *textMargin.marginTop + currentHeight);
-        renderLayout(cr, lowerLayout_.get());
-        pango_layout_get_pixel_size(lowerLayout_.get(), &w, &h);
-        currentHeight += h + extraH;
+        renderLayout(cr, lowerLayout_.get(), *textMargin.marginLeft,
+                     *textMargin.marginTop + currentHeight);
+        pango_layout_get_pixel_size(lowerLayout_.get(), &w, nullptr);
+        currentHeight += fontHeight + extraH;
     }
 
     bool vertical = parent_->config().verticalCandidateList.value();
@@ -472,6 +538,11 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
     candidateRegions_.clear();
     candidateRegions_.reserve(nCandidates_);
     size_t wholeW = 0, wholeH = 0;
+
+    // size of text = textMargin + actual text size.
+    // HighLight = HighLight margin + TEXT.
+    // Click region = HighLight - click
+
     for (size_t i = 0; i < nCandidates_; i++) {
         int x, y;
         if (vertical) {
@@ -484,17 +555,17 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
         x += *textMargin.marginLeft;
         y += *textMargin.marginTop;
         int labelW = 0, labelH = 0, candidateW = 0, candidateH = 0;
-        if (pango_layout_get_character_count(labelLayouts_[i].get())) {
-            pango_layout_get_pixel_size(labelLayouts_[i].get(), &labelW,
-                                        &labelH);
+        if (labelLayouts_[i].characterCount()) {
+            labelW = labelLayouts_[i].width();
+            labelH = fontHeight * labelLayouts_[i].size();
         }
-        if (pango_layout_get_character_count(candidateLayouts_[i].get())) {
-            pango_layout_get_pixel_size(candidateLayouts_[i].get(), &candidateW,
-                                        &candidateH);
+        if (candidateLayouts_[i].characterCount()) {
+            candidateW = candidateLayouts_[i].width();
+            candidateH = fontHeight * candidateLayouts_[i].size();
         }
         int vheight;
         if (vertical) {
-            vheight = std::max(labelH, candidateH);
+            vheight = std::max({fontHeight, labelH, candidateH});
             wholeH += vheight + extraH;
         } else {
             vheight = candidatesHeight_ - extraH;
@@ -511,7 +582,8 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
                               << highlightWidth + *highlightMargin.marginLeft +
                                      *highlightMargin.marginRight;
         }
-        int highlightIndex = (hoverIndex_ > 0) ? hoverIndex_ : candidateIndex_;
+        const int highlightIndex = highlight();
+        bool highlight = false;
         if (highlightIndex >= 0 && i == static_cast<size_t>(highlightIndex)) {
             cairo_save(cr);
             cairo_translate(cr, x - *highlightMargin.marginLeft,
@@ -522,22 +594,14 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
                         vheight + *highlightMargin.marginTop +
                             *highlightMargin.marginBottom);
             cairo_restore(cr);
-            pango_layout_set_attributes(labelLayouts_[i].get(),
-                                        highlightLabelAttrLists_[i].get());
-            pango_layout_set_attributes(candidateLayouts_[i].get(),
-                                        highlightCandidateAttrLists_[i].get());
-        } else {
-            pango_layout_set_attributes(labelLayouts_[i].get(),
-                                        labelAttrLists_[i].get());
-
-            pango_layout_set_attributes(candidateLayouts_[i].get(),
-                                        candidateAttrLists_[i].get());
+            highlight = true;
         }
         Rect candidateRegion;
         candidateRegion
-            .setPosition(
-                x - *highlightMargin.marginLeft + *clickMargin.marginLeft,
-                y - *highlightMargin.marginTop + *clickMargin.marginTop)
+            .setPosition(*margin.marginLeft + x - *highlightMargin.marginLeft +
+                             *clickMargin.marginLeft,
+                         *margin.marginTop + y - *highlightMargin.marginTop +
+                             *clickMargin.marginTop)
             .setSize(highlightWidth + *highlightMargin.marginLeft +
                          *highlightMargin.marginRight -
                          *clickMargin.marginLeft - *clickMargin.marginRight,
@@ -545,13 +609,12 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
                          *highlightMargin.marginBottom -
                          *clickMargin.marginTop - *clickMargin.marginBottom);
         candidateRegions_.push_back(candidateRegion);
-        if (pango_layout_get_character_count(labelLayouts_[i].get())) {
-            cairo_move_to(cr, x, y + (vheight - labelH) / 2.0);
-            renderLayout(cr, labelLayouts_[i].get());
+        if (labelLayouts_[i].characterCount()) {
+            labelLayouts_[i].render(cr, x, y, fontHeight, highlight);
         }
-        if (pango_layout_get_character_count(candidateLayouts_[i].get())) {
-            cairo_move_to(cr, x + labelW, y + (vheight - candidateH) / 2.0);
-            renderLayout(cr, candidateLayouts_[i].get());
+        if (candidateLayouts_[i].characterCount()) {
+            candidateLayouts_[i].render(cr, x + labelW, y, fontHeight,
+                                        highlight);
         }
     }
     cairo_restore(cr);
@@ -621,7 +684,7 @@ void InputWindow::wheel(bool up) {
 }
 
 int InputWindow::highlight() const {
-    int highlightIndex = (hoverIndex_ > 0) ? hoverIndex_ : candidateIndex_;
+    int highlightIndex = (hoverIndex_ >= 0) ? hoverIndex_ : candidateIndex_;
     return highlightIndex;
 }
 

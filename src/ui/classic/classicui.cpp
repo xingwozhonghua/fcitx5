@@ -17,7 +17,9 @@
 #include "fcitx/instance.h"
 #include "fcitx/userinterfacemanager.h"
 #include "notificationitem_public.h"
+#ifdef ENABLE_X11
 #include "xcbui.h"
+#endif
 #ifdef WAYLAND_FOUND
 #include "waylandui.h"
 #endif
@@ -29,6 +31,7 @@ FCITX_DEFINE_LOG_CATEGORY(classicui_logcategory, "classicui");
 ClassicUI::ClassicUI(Instance *instance) : instance_(instance) {
     reloadConfig();
 
+#ifdef ENABLE_X11
     if (auto *xcbAddon = xcb()) {
         xcbCreatedCallback_ =
             xcbAddon->call<IXCBModule::addConnectionCreatedCallback>(
@@ -43,6 +46,7 @@ ClassicUI::ClassicUI(Instance *instance) : instance_(instance) {
                     uis_.erase("x11:" + name);
                 });
     }
+#endif
 
 #ifdef WAYLAND_FOUND
     if (auto *waylandAddon = wayland()) {
@@ -72,16 +76,7 @@ void ClassicUI::reloadConfig() {
     reloadTheme();
 }
 
-void ClassicUI::reloadTheme() {
-
-    auto themeConfigFile = StandardPath::global().open(
-        StandardPath::Type::PkgData,
-        stringutils::joinPath("themes", *config_.theme, "theme.conf"),
-        O_RDONLY);
-    RawConfig themeConfig;
-    readFromIni(themeConfig, themeConfigFile.fd());
-    theme_.load(*config_.theme, themeConfig);
-}
+void ClassicUI::reloadTheme() { theme_.load(*config_.theme); }
 
 void ClassicUI::suspend() {
     suspended_ = true;
@@ -230,12 +225,14 @@ void ClassicUI::update(UserInterfaceComponent component,
         // for now, though position is wrong. We don't know which is xwayland
         // unfortunately, hopefully main display is X wayland.
         // The position will be wrong anyway.
+#ifdef ENABLE_X11
         auto mainX11Display = xcb()->call<IXCBModule::mainDisplay>();
         if (!mainX11Display.empty()) {
             if (auto *uiPtr = findValue(uis_, "x11:" + mainX11Display)) {
                 ui = uiPtr->get();
             }
         }
+#endif
     } else {
         if (auto *uiPtr = findValue(uis_, inputContext->display())) {
             ui = uiPtr->get();
@@ -244,6 +241,9 @@ void ClassicUI::update(UserInterfaceComponent component,
 
     if (ui) {
         ui->update(component, inputContext);
+        if (component == UserInterfaceComponent::StatusArea) {
+            ui->updateCurrentInputMethod(inputContext);
+        }
     }
 }
 
@@ -254,5 +254,44 @@ public:
     }
 };
 } // namespace fcitx::classicui
+
+const fcitx::Configuration *
+fcitx::classicui::ClassicUI::getSubConfig(const std::string &path) const {
+    if (!stringutils::startsWith(path, "theme/")) {
+        return nullptr;
+    }
+
+    auto name = path.substr(6);
+    if (name.empty()) {
+        return nullptr;
+    }
+
+    if (name == *config_.theme) {
+        return &theme_;
+    }
+
+    subconfigTheme_.load(name);
+    return &subconfigTheme_;
+}
+
+void fcitx::classicui::ClassicUI::setSubConfig(const std::string &path,
+                                               const fcitx::RawConfig &config) {
+    if (!stringutils::startsWith(path, "theme/")) {
+        return;
+    }
+    auto name = path.substr(6);
+    if (name.empty()) {
+        return;
+    }
+
+    auto &theme = name == *config_.theme ? theme_ : subconfigTheme_;
+    if (&theme == &subconfigTheme_) {
+        // Fill the system value.
+        getSubConfig(path);
+    }
+    theme.load(name, config);
+    safeSaveAsIni(theme, StandardPath::Type::PkgData,
+                  stringutils::joinPath("themes", name, "theme.conf"));
+}
 
 FCITX_ADDON_FACTORY(fcitx::classicui::ClassicUIFactory);

@@ -24,13 +24,18 @@ public:
 
     dbus::Bus *bus();
     bool lockGroup(int group);
+    bool hasXkbHelper() const;
     FCITX_ADDON_DEPENDENCY_LOADER(keyboard, instance_->addonManager());
     FCITX_ADDON_DEPENDENCY_LOADER(xcb, instance_->addonManager());
 
 private:
     FCITX_ADDON_EXPORT_FUNCTION(DBusModule, bus);
     FCITX_ADDON_EXPORT_FUNCTION(DBusModule, lockGroup);
+    FCITX_ADDON_EXPORT_FUNCTION(DBusModule, hasXkbHelper);
 
+    std::unique_ptr<dbus::Bus> connectToSessionBus();
+
+    Instance *instance_;
     std::unique_ptr<dbus::Bus> bus_;
     std::unique_ptr<dbus::Slot> disconnectedSlot_;
     std::unique_ptr<dbus::ServiceWatcher> serviceWatcher_;
@@ -40,7 +45,6 @@ private:
         xkbWatcher_;
     std::string xkbHelperName_;
     std::unique_ptr<Controller1> controller_;
-    Instance *instance_;
 };
 } // namespace fcitx
 

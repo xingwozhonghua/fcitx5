@@ -1,9 +1,0 @@
-[Addon]
-Name=DBus Frontend
-Type=SharedLibrary
-Library=dbusfrontend
-Category=Frontend
-
-[Addon/Dependencies]
-0=dbus
-

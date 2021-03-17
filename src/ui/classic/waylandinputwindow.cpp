@@ -5,12 +5,19 @@
  *
  */
 #include "waylandinputwindow.h"
-#include <linux/input-event-codes.h>
 #include "waylandim_public.h"
 #include "waylandui.h"
 #include "waylandwindow.h"
 #include "zwp_input_panel_v1.h"
 #include "zwp_input_popup_surface_v2.h"
+
+#ifdef __linux__
+#include <linux/input-event-codes.h>
+#elif __FreeBSD__
+#include <dev/evdev/input-event-codes.h>
+#else
+#define BTN_LEFT 0x110
+#endif
 
 namespace fcitx::classicui {
 
@@ -67,12 +74,15 @@ void WaylandInputWindow::initPanel() {
     if (panelSurface_) {
         return;
     }
-    auto panel = ui_->display()->getGlobals<wayland::ZwpInputPanelV1>();
-    if (panel.empty()) {
+    if (!window_->surface()) {
+        window_->createWindow();
         return;
     }
-    auto iface = panel[0];
-    panelSurface_.reset(iface->getInputPanelSurface(window_->surface()));
+    auto panel = ui_->display()->getGlobal<wayland::ZwpInputPanelV1>();
+    if (!panel) {
+        return;
+    }
+    panelSurface_.reset(panel->getInputPanelSurface(window_->surface()));
     panelSurface_->setOverlayPanel();
 }
 
@@ -89,6 +99,10 @@ void WaylandInputWindow::update(fcitx::InputContext *ic) {
             panelSurfaceV2_.reset(im->getInputPopupSurface(window_->surface()));
         }
     }
+    if (!panelSurface_ && !panelSurfaceV2_) {
+        return;
+    }
+
     if (!visible()) {
         window_->hide();
         return;

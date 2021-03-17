@@ -103,6 +103,7 @@ enum class EventType : uint32_t {
      */
     InputMethodGroupChanged = InstanceEventFlag | 0x1,
     InputMethodGroupAboutToChange = InstanceEventFlag | 0x2,
+    UIChanged = InstanceEventFlag | 0x3,
 };
 
 /**
@@ -168,9 +169,7 @@ protected:
 class FCITXCORE_EXPORT KeyEventBase : public InputContextEvent {
 public:
     KeyEventBase(EventType type, InputContext *context, Key rawKey,
-                 bool isRelease = false, int time = 0)
-        : InputContextEvent(context, type), key_(rawKey.normalize()),
-          origKey_(key_), rawKey_(rawKey), isRelease_(isRelease), time_(time) {}
+                 bool isRelease = false, int time = 0);
     KeyEventBase(const KeyEventBase &) = default;
 
     /**
@@ -180,10 +179,37 @@ public:
      */
     Key key() const { return key_; }
 
+    /**
+     * It will automatically be called if input method layout does not match the
+     * system keyboard layout.
+     *
+     * @param key p_key:...
+     */
     void setKey(const Key &key) {
         key_ = key;
         forward_ = true;
     }
+
+    /**
+     * It is designed for faking the key event. Normally should not be used.
+     *
+     * @param key key event to override.
+     * @since 5.0.4
+     */
+    void setRawKey(const Key &key) {
+        rawKey_ = key;
+        key_ = key.normalize();
+        forward_ = true;
+    }
+
+    /**
+     * It is designed for overriding the key forward option. Normally should not
+     * be used.
+     *
+     * @param forward
+     * @since 5.0.4
+     */
+    void setForward(bool forward) { forward_ = forward; }
 
     /**
      * Key event regardless of keyboard layout conversion.
@@ -191,9 +217,25 @@ public:
      * @return fcitx::Key
      */
     Key origKey() const { return origKey_; }
+
+    /**
+     * Key event after layout conversion.
+     *
+     * Basically it is the "unnormalized" key event.
+     *
+     * @return fcitx::Key
+     */
     Key rawKey() const { return rawKey_; }
     bool isRelease() const { return isRelease_; }
     int time() const { return time_; }
+
+    /**
+     * If true, the key that produce character will commit a string.
+     *
+     * This is currently used by internal keyboard layout translation.
+     *
+     * @return bool
+     */
     bool forward() const { return forward_; }
 
 protected:
@@ -338,6 +380,11 @@ class FCITXCORE_EXPORT InputMethodGroupAboutToChangeEvent : public Event {
 public:
     InputMethodGroupAboutToChangeEvent()
         : Event(EventType::InputMethodGroupAboutToChange) {}
+};
+
+class FCITXCORE_EXPORT UIChangedEvent : public Event {
+public:
+    UIChangedEvent() : Event(EventType::UIChanged) {}
 };
 
 class FCITXCORE_EXPORT CapabilityEvent : public InputContextEvent {

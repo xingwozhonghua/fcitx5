@@ -15,6 +15,9 @@ namespace fcitx {
 
 namespace impl {
 
+FCITX_CONFIG_ENUM_I18N_ANNOTATION(PropertyPropagatePolicy, N_("All"),
+                                  N_("Program"), N_("No"));
+
 FCITX_CONFIGURATION(
     HotkeyConfig,
     KeyListOption triggerKeys{
@@ -48,6 +51,9 @@ FCITX_CONFIGURATION(
         {Key("Control+Shift_R")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess,
                           KeyConstrainFlag::AllowModifierOnly})};
+    Option<bool> enumerateSkipFirst{
+        this, "EnumerateSkipFirst",
+        _("Skip first input method while enumerating"), false};
     KeyListOption enumerateGroupForwardKeys{
         this,
         "EnumerateGroupForwardKeys",
@@ -78,18 +84,29 @@ FCITX_CONFIGURATION(
         {Key("Hangul_Romaja")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess,
                           KeyConstrainFlag::AllowModifierOnly})};
-    KeyListOption defaultPrevPage{
-        this,
-        "PrevPage",
-        _("Default Previous page"),
-        {Key("Up")},
-        KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
-    KeyListOption defaultNextPage{
-        this,
-        "NextPage",
-        _("Default Next page"),
-        {Key("Down")},
-        KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
+    Option<KeyList, ListConstrain<KeyConstrain>, DefaultMarshaller<KeyList>,
+           ToolTipAnnotation>
+        defaultPrevPage{this,
+                        "PrevPage",
+                        _("Default Previous page"),
+                        {Key("Up")},
+                        KeyListConstrain({KeyConstrainFlag::AllowModifierLess}),
+                        {},
+                        {_("Input methods may have different setup in their "
+                           "own configuration. This is commonly used by "
+                           "modules like clipboard or quickphrase.")}};
+
+    Option<KeyList, ListConstrain<KeyConstrain>, DefaultMarshaller<KeyList>,
+           ToolTipAnnotation>
+        defaultNextPage{this,
+                        "NextPage",
+                        _("Default Next page"),
+                        {Key("Down")},
+                        KeyListConstrain({KeyConstrainFlag::AllowModifierLess}),
+                        {},
+                        {_("Input methods may have different setup in their "
+                           "own configuration. This is commonly used by "
+                           "modules like clipboard or quickphrase.")}};
     KeyListOption defaultPrevCandidate{
         this,
         "PrevCandidate",
@@ -111,15 +128,25 @@ FCITX_CONFIGURATION(
 FCITX_CONFIGURATION(
     BehaviorConfig, Option<bool> activeByDefault{this, "ActiveByDefault",
                                                  _("Active By Default")};
-    Option<PropertyPropagatePolicy> shareState{this, "ShareInputState",
-                                               _("Share Input State"),
-                                               PropertyPropagatePolicy::No};
+    OptionWithAnnotation<PropertyPropagatePolicy,
+                         PropertyPropagatePolicyI18NAnnotation>
+        shareState{this, "ShareInputState", _("Share Input State"),
+                   PropertyPropagatePolicy::No};
+    Option<bool> preeditEnabledByDefault{this, "PreeditEnabledByDefault",
+                                         _("Show preedit in application"),
+                                         true};
     Option<bool> showInputMethodInformation{
         this, "ShowInputMethodInformation",
         _("Show Input Method Information when switch input method"), true};
     Option<bool> showInputMethodInformationWhenFocusIn{
         this, "showInputMethodInformationWhenFocusIn",
         _("Show Input Method Information when changing focus"), false};
+    Option<bool> compactInputMethodInformation{
+        this, "CompactInputMethodInformation",
+        _("Show compact input method information"), true};
+    Option<bool> showFirstInputMethodInformation{
+        this, "ShowFirstInputMethodInformation",
+        _("Show first input method information"), true};
     Option<int, IntConstrain> defaultPageSize{this, "DefaultPageSize",
                                               _("Default page size"), 5,
                                               IntConstrain(1, 10)};
@@ -193,6 +220,11 @@ const KeyList &GlobalConfig::enumerateBackwardKeys() const {
     return d->hotkey->enumerateBackwardKeys.value();
 }
 
+bool GlobalConfig::enumerateSkipFirst() const {
+    FCITX_D();
+    return *d->hotkey->enumerateSkipFirst;
+}
+
 const KeyList &GlobalConfig::enumerateGroupForwardKeys() const {
     FCITX_D();
     return *d->hotkey->enumerateGroupForwardKeys;
@@ -223,9 +255,24 @@ bool GlobalConfig::showInputMethodInformationWhenFocusIn() const {
     return d->behavior->showInputMethodInformationWhenFocusIn.value();
 }
 
+bool GlobalConfig::compactInputMethodInformation() const {
+    FCITX_D();
+    return d->behavior->compactInputMethodInformation.value();
+}
+
+bool GlobalConfig::showFirstInputMethodInformation() const {
+    FCITX_D();
+    return d->behavior->showFirstInputMethodInformation.value();
+}
+
 PropertyPropagatePolicy GlobalConfig::shareInputState() const {
     FCITX_D();
     return d->behavior->shareState.value();
+}
+
+bool GlobalConfig::preeditEnabledByDefault() const {
+    FCITX_D();
+    return d->behavior->preeditEnabledByDefault.value();
 }
 
 const KeyList &GlobalConfig::defaultPrevPage() const {

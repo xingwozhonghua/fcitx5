@@ -31,6 +31,7 @@ public:
     const KeyList &deactivateKeys() const;
     const KeyList &enumerateForwardKeys() const;
     const KeyList &enumerateBackwardKeys() const;
+    bool enumerateSkipFirst() const;
     const KeyList &enumerateGroupForwardKeys() const;
     const KeyList &enumerateGroupBackwardKeys() const;
     const KeyList &togglePreeditKeys() const;
@@ -38,7 +39,10 @@ public:
     bool activeByDefault() const;
     bool showInputMethodInformation() const;
     bool showInputMethodInformationWhenFocusIn() const;
+    bool compactInputMethodInformation() const;
+    bool showFirstInputMethodInformation() const;
     PropertyPropagatePolicy shareInputState() const;
+    bool preeditEnabledByDefault() const;
 
     const KeyList &defaultPrevPage() const;
     const KeyList &defaultNextPage() const;

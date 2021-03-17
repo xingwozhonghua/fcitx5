@@ -1,9 +1,0 @@
-[Addon]
-Name=Wayland Input method frontend
-Type=SharedLibrary
-Library=waylandim
-Category=Frontend
-
-[Addon/Dependencies]
-0=wayland
-

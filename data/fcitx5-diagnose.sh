@@ -139,19 +139,6 @@ __conf_dir_init() {
 }
 __conf_dir_init
 
-get_config_dir() {
-    local default_name="$2"
-    local path
-    for path in "/usr/share/fcitx5/${default_name}" \
-        "/usr/local/share/fcitx5/${default_name}"; do
-        [ ! -z "${path}" ] && [ -d "${path}" ] && {
-            echo "${path}"
-            return 0
-        }
-    done 2> /dev/null
-    return 1
-}
-
 get_from_config_file() {
     local file="$1"
     local key="$2"
@@ -745,7 +732,7 @@ fcitx_lib_path=()
 init_fcitx_lib_path() {
     local path
     local __fcitx_lib_path
-    fcitx_lib_path=(/usr/lib/fcitx5/ /usr/local/lib/fcitx5/)
+    fcitx_lib_path=(/usr/lib/fcitx5/ /usr/local/lib/fcitx5/ '@FCITX_INSTALL_ADDONDIR@')
 }
 init_fcitx_lib_path
 
@@ -1204,25 +1191,31 @@ check_qt() {
     for file in "${qt_modules[@]}"; do
         basename=$(basename "${file}")
         __need_blank_line=0
+        qt_version=qt
+        if [[ $file =~ qt5 ]]; then
+            qt_version=qt5
+        elif [[ $file =~ qt6 ]]; then
+            qt_version=qt6
+        fi
+
         if [[ ${basename} =~ im-fcitx5 ]] &&
             [[ ${file} =~ plugins/inputmethods ]]; then
             write_eval "$(_ 'Found ${3} im module for ${2}: ${1}.')" \
-                "$(code_inline "${file}")" Qt4 fcitx5
+                "$(code_inline "${file}")" qt4 fcitx5
             qt4_module_found=1
         elif [[ ${basename} =~ fcitx5platforminputcontextplugin ]] &&
             [[ ${file} =~ plugins/platforminputcontexts ]]; then
             write_eval "$(_ 'Found ${3} im module for ${2}: ${1}.')" \
-                "$(code_inline "${file}")" Qt5 fcitx5
-            qt5_module_found=1
-        elif [[ ${file} =~ /fcitx5/qt/ ]]; then
+                "$(code_inline "${file}")" ${qt_version} fcitx5
+            if [[ ${qt_version} != "qt6" ]]; then
+                qt5_module_found=1
+            fi
+        elif [[ ${file} =~ /fcitx5/qt ]]; then
             write_eval "$(_ 'Found ${1} ${2} module: ${3}.')" \
-                        fcitx5 qt4 "$(code_inline "${file}")"
-        elif [[ ${file} =~ /fcitx5/qt5/ ]]; then
-            write_eval "$(_ 'Found ${1} ${2} module: ${3}.')" \
-                        fcitx5 qt5 "$(code_inline "${file}")"
+                        fcitx5 ${qt_version} "$(code_inline "${file}")"
         else
             write_eval "$(_ 'Found unknown ${1} qt module: ${2}.')" \
-                       fcitx5 \
+                       fcitx \
                        "$(code_inline "${file}")"
         fi
     done
@@ -1239,6 +1232,7 @@ check_qt() {
 }
 
 init_gtk_dirs() {
+    local version="$1"
     local gtk_dirs_name="__gtk${version}_dirs"
     eval '((${#'"${gtk_dirs_name}"'[@]}))' || {
         find_file "${gtk_dirs_name}" -H "${ldpaths[@]}" -type d \
@@ -1248,13 +1242,14 @@ init_gtk_dirs() {
 }
 
 find_gtk_query_immodules() {
+    gtk_query_immodules=()
     local version="$1"
     init_gtk_dirs "${version}"
+    [ "${#gtk_dirs[@]}" = 0 ] && return
     local IFS=$'\n'
     local query_im_lib
     find_file query_im_lib -H "${gtk_dirs[@]}" -type f \
         -name "gtk-query-immodules-${version}*"
-    gtk_query_immodules=()
     unique_file_array "gtk_query_immodules_${version}" gtk_query_immodules \
         $(find_in_path "gtk-query-immodules-${version}*") \
         "${query_im_lib[@]}"
@@ -1266,6 +1261,19 @@ reg_gtk_query_output() {
         regex='"(/[^"]*\.so)"'
         [[ $line =~ $regex ]] || continue
         file=${BASH_REMATCH[1]}
+        add_and_check_file "__gtk_immodule_files_${version}" "${file}" && {
+            array_push "gtk_immodule_files_${version}" "${file}"
+        }
+    done <<< "$2"
+}
+
+reg_gtk_query_output_gio() {
+    local version="$1"
+    local dir="$3"
+    while read line; do
+        regex='(lib[^ /]*.so)'
+        [[ $line =~ $regex ]] || continue
+        file="$dir/${BASH_REMATCH[1]}"
         add_and_check_file "__gtk_immodule_files_${version}" "${file}" && {
             array_push "gtk_immodule_files_${version}" "${file}"
         }
@@ -1363,6 +1371,7 @@ check_gtk_query_immodule() {
 find_gtk_immodules_cache() {
     local version="$1"
     init_gtk_dirs "${version}"
+    [ "${#gtk_dirs[@]}" = 0 ] && return
     local IFS=$'\n'
     local __gtk_immodule_cache
     find_file __gtk_immodule_cache -H \
@@ -1442,6 +1451,59 @@ check_gtk_immodule_cache() {
     }
 }
 
+find_gtk_immodules_cache_gio() {
+    local version="$1"
+    init_gtk_dirs "${version}"
+    [ "${#gtk_dirs[@]}" = 0 ] && return
+    local IFS=$'\n'
+    local __gtk_immodule_cache
+    find_file __gtk_immodule_cache -H \
+        "${gtk_dirs[@]}" /etc/gtk-${version}* -type f -path '*/immodules/giomodule.cache'
+    unique_file_array "gtk_immodules_cache_${version}" "$2" \
+        "${__gtk_immodule_cache[@]}"
+}
+
+check_gtk_immodule_cache_gio() {
+    local version="$1"
+    local IFS=$'\n'
+    local cache_found=0
+    local module_found=0
+    write_order_list "gtk ${version}:"
+    local gtk_immodules_cache
+    find_gtk_immodules_cache_gio "${version}" gtk_immodules_cache
+
+    for cache in "${gtk_immodules_cache[@]}"; do
+        cache_found=1
+        write_eval \
+            "$(_ 'Found immodules cache for gtk ${1} at ${2}.')" \
+            "$(code_inline ${version})" \
+            "$(code_inline "${cache}")"
+        cache_content=$(cat "${cache}")
+        if fcitx_gtk=$(grep fcitx5 <<< "${cache_content}"); then
+            module_found=1
+            __need_blank_line=0
+            write_eval "$(_ 'Found ${1} im modules for gtk ${2}.')" \
+                       fcitx5 "$(code_inline ${version})"
+            write_quote_str "${fcitx_gtk}"
+            reg_gtk_query_output_gio "${version}" "${fcitx_gtk}" "${cache%/*}"
+        else
+            write_error_eval \
+                "$(_ 'Failed to find ${1} in immodule cache at ${2}')" \
+                fcitx5 "$(code_inline "${cache}")"
+        fi
+    done
+    ((cache_found)) || {
+        write_error_eval \
+            "$(_ 'Cannot find immodules cache for gtk ${1}')" \
+            "${version}"
+    }
+    ((module_found)) || {
+        write_error_eval \
+            "$(_ 'Cannot find ${1} im module for gtk ${2} in cache.')" \
+            fcitx5 "${version}"
+    }
+}
+
 check_gtk() {
     write_title 2 "Gtk:"
     _check_toolkit_env gtk GTK_IM_MODULE
@@ -1454,11 +1516,13 @@ check_gtk() {
     increase_cur_level 1
     check_gtk_immodule_cache 2
     check_gtk_immodule_cache 3
+    check_gtk_immodule_cache_gio 4
     increase_cur_level -1
     write_order_list "$(_ 'Gtk IM module files:')"
     increase_cur_level 1
     check_gtk_immodule_file 2
     check_gtk_immodule_file 3
+    check_gtk_immodule_file 4
     increase_cur_level -1
 }
 
@@ -1468,13 +1532,9 @@ check_gtk() {
 #############################
 
 check_modules() {
-    local addon_conf_dir
     write_title 2 "$(_ 'Fcitx Addons:')"
     write_order_list "$(_ 'Addon Config Dir:')"
-    addon_conf_dir="$(get_config_dir addonconfigdir addon)" || {
-        write_error "$(_ 'Cannot find ${1} addon config directory.')" fcitx5
-        return
-    }
+    local addon_conf_dir='@FCITX_INSTALL_PKGDATADIR@/addon'
     local enabled_addon=()
     local disabled_addon=()
     local enabled_ui_name=()
@@ -1488,6 +1548,10 @@ check_modules() {
     local addon_name
     declare -A addon_file
     declare -A disabled_addon_config
+    if [ ! -d "${addon_conf_dir}" ]; then
+      write_error_eval "$(_ 'Cannot find ${1} addon config directory.')" fcitx5
+      return
+    fi
     write_eval "$(_ 'Found ${1} addon config directory: ${2}.')" \
                fcitx5 "$(code_inline "${addon_conf_dir}")"
     if [[ -f "${fx_conf_home}/config" ]]; then
@@ -1523,7 +1587,8 @@ check_modules() {
         fi
         type=$(get_from_config_file "${file}" Type)
         if [[ -z $type ]] || [[ $type = SharedLibrary ]]; then
-            addon_file["${name}"]="$(get_from_config_file "${file}" Library)"
+            addon_file_name="$(get_from_config_file "${file}" Library)"
+            addon_file["${name}"]="${addon_file_name/export:/}"
         fi
     done
     increase_cur_level 1

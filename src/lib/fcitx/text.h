@@ -8,7 +8,9 @@
 #define _FCITX_TEXT_H_
 
 #include <memory>
+#include <ostream>
 #include <string>
+#include <vector>
 #include <fcitx-utils/flags.h>
 #include <fcitx-utils/macros.h>
 #include <fcitx-utils/textformatflags.h>
@@ -44,10 +46,21 @@ public:
     std::string toString() const;
     std::string toStringForCommit() const;
 
+    /**
+     * Split Text object into lines.
+     *
+     * @return lines.
+     * @since 5.0.6
+     */
+    std::vector<Text> splitByLine() const;
+
 private:
     std::unique_ptr<TextPrivate> d_ptr;
     FCITX_DECLARE_PRIVATE(Text);
 };
+
+FCITXCORE_EXPORT std::ostream &operator<<(std::ostream &os, const Text &text);
+
 } // namespace fcitx
 
 #endif // _FCITX_TEXT_H_

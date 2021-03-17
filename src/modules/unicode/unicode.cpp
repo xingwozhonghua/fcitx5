@@ -77,7 +77,7 @@ Unicode::Unicode(Instance *instance)
             if (keyEvent.isRelease()) {
                 return;
             }
-            if (keyEvent.key().check(toggleKey_)) {
+            if (keyEvent.key().check(toggleKey_) && data_.load()) {
                 trigger(keyEvent.inputContext());
                 keyEvent.filterAndAccept();
                 return;
@@ -179,7 +179,8 @@ Unicode::Unicode(Instance *instance)
                 state->reset(inputContext);
                 return;
             }
-            if (keyEvent.key().check(FcitxKey_Return)) {
+            if (keyEvent.key().check(FcitxKey_Return) ||
+                keyEvent.key().check(FcitxKey_KP_Enter)) {
                 keyEvent.accept();
                 if (candidateList->size() > 0 &&
                     candidateList->cursorIndex() >= 0) {
@@ -205,16 +206,16 @@ Unicode::Unicode(Instance *instance)
             }
 
             // check compose first.
-            auto compose =
-                instance_->processCompose(inputContext, keyEvent.key().sym());
+            auto compose = instance_->processComposeString(
+                inputContext, keyEvent.key().sym());
 
             // compose is invalid, ignore it.
-            if (compose == FCITX_INVALID_COMPOSE_RESULT) {
+            if (!compose) {
                 return event.accept();
             }
 
-            if (compose) {
-                state->buffer_.type(compose);
+            if (!compose->empty()) {
+                state->buffer_.type(*compose);
             } else {
                 state->buffer_.type(Key::keySymToUnicode(keyEvent.key().sym()));
             }

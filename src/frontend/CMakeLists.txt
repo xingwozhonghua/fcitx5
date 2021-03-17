@@ -1,7 +1,11 @@
 add_subdirectory(xim)
-add_subdirectory(dbusfrontend)
 
 if (WAYLAND_FOUND)
     add_subdirectory(waylandim)
 endif()
-add_subdirectory(ibusfrontend)
+
+if (ENABLE_DBUS)
+    add_subdirectory(dbusfrontend)
+    add_subdirectory(fcitx4frontend)
+    add_subdirectory(ibusfrontend)
+endif()

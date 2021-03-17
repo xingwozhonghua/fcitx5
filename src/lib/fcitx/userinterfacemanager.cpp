@@ -9,6 +9,7 @@
 #include <set>
 #include "action.h"
 #include "inputcontext.h"
+#include "instance.h"
 #include "userinterface.h"
 
 namespace fcitx {
@@ -206,7 +207,9 @@ void UserInterfaceManager::flush() {
     FCITX_D();
     for (auto &p : d->updateList_) {
         for (auto comp : p.second) {
-            if (p.first->capabilityFlags().test(CapabilityFlag::ClientSideUI)) {
+            if (comp == UserInterfaceComponent::InputPanel &&
+                p.first->capabilityFlags().test(
+                    CapabilityFlag::ClientSideInputPanel)) {
                 p.first->updateClientSideUIImpl();
             } else if (d->ui_) {
                 d->ui_->update(comp, p.first);
@@ -240,6 +243,9 @@ void UserInterfaceManager::updateAvailability() {
         }
         d->ui_ = newUI;
         d->uiName_ = newUIName;
+        if (d->addonManager_->instance()) {
+            d->addonManager_->instance()->postEvent(UIChangedEvent());
+        }
     }
 }
 

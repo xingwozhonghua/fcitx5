@@ -180,7 +180,8 @@ QuickPhrase::QuickPhrase(Instance *instance)
                 state->reset(inputContext);
                 return;
             }
-            if (keyEvent.key().check(FcitxKey_Return)) {
+            if (keyEvent.key().check(FcitxKey_Return) ||
+                keyEvent.key().check(FcitxKey_KP_Enter)) {
                 keyEvent.accept();
                 if (!state->typed_ && state->buffer_.empty() &&
                     !state->str_.empty() && !state->alt_.empty()) {
@@ -218,16 +219,16 @@ QuickPhrase::QuickPhrase(Instance *instance)
             }
 
             // check compose first.
-            auto compose =
-                instance_->processCompose(inputContext, keyEvent.key().sym());
+            auto compose = instance_->processComposeString(
+                inputContext, keyEvent.key().sym());
 
             // compose is invalid, ignore it.
-            if (compose == FCITX_INVALID_COMPOSE_RESULT) {
+            if (!compose) {
                 return event.accept();
             }
 
-            if (compose) {
-                state->buffer_.type(compose);
+            if (!compose->empty()) {
+                state->buffer_.type(*compose);
             } else {
                 state->buffer_.type(Key::keySymToUnicode(keyEvent.key().sym()));
             }
@@ -381,7 +382,11 @@ void QuickPhrase::updateUI(InputContext *inputContext) {
     if (!state->prefix_.empty()) {
         preedit.append(state->prefix_);
     }
-    preedit.append(state->buffer_.userInput());
+    const bool useClientPreedit =
+        inputContext->capabilityFlags().test(CapabilityFlag::Preedit);
+    TextFormatFlags format{useClientPreedit ? TextFormatFlag::Underline
+                                            : TextFormatFlag::NoFlag};
+    preedit.append(state->buffer_.userInput(), format);
     if (!state->buffer_.empty()) {
         preedit.setCursor(state->prefix_.size() +
                           state->buffer_.cursorByChar());
@@ -391,9 +396,13 @@ void QuickPhrase::updateUI(InputContext *inputContext) {
     if (!state->typed_) {
         auxUp.append(state->text_);
     }
-    // inputContext->inputPanel().setClientPreedit(preedit);
     inputContext->inputPanel().setAuxUp(auxUp);
-    inputContext->inputPanel().setPreedit(preedit);
+    if (useClientPreedit) {
+        preedit.setCursor(0);
+        inputContext->inputPanel().setClientPreedit(preedit);
+    } else {
+        inputContext->inputPanel().setPreedit(preedit);
+    }
     inputContext->updatePreedit();
     inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
 }
@@ -418,6 +427,17 @@ void QuickPhrase::trigger(InputContext *ic, const std::string &text,
     state->str_ = str;
     state->alt_ = alt;
     state->key_ = key;
+    state->buffer_.clear();
+    updateUI(ic);
+}
+
+void QuickPhrase::setBuffer(InputContext *ic, const std::string &text) {
+    auto *state = ic->propertyFor(&factory_);
+    if (!state->enabled_) {
+        return;
+    }
+    state->buffer_.clear();
+    state->buffer_.type(text);
     updateUI(ic);
 }
 

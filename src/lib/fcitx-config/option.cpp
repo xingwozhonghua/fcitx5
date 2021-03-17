@@ -16,7 +16,7 @@ OptionBase::OptionBase(Configuration *parent, std::string path,
     : parent_(parent), path_(std::move(path)),
       description_(std::move(description)) {
 
-    // Force the rule of "/" not allowed in option, so our live of GUI would be
+    // Force the rule of "/" not allowed in option, so our life of GUI would be
     // easier.
     if (path_.find('/') != std::string::npos) {
         throw std::invalid_argument(
@@ -64,5 +64,10 @@ void ExternalOption::dumpDescription(RawConfig &config) const {
     config.setValueByPath("External", externalUri_);
     // This field is required by dbus.
     config.setValueByPath("DefaultValue", "");
+}
+
+void SubConfigOption::dumpDescription(RawConfig &config) const {
+    ExternalOption::dumpDescription(config);
+    config.setValueByPath("LaunchSubConfig", "True");
 }
 } // namespace fcitx

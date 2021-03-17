@@ -8,7 +8,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fmt/format.h>
+#include "config.h"
 #include "log.h"
+
+#if defined(LIBKVM_FOUND)
+#include <fcntl.h>
+#include <kvm.h>
+#include <sys/param.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#elif defined(__APPLE__)
+#include <libproc.h>
+#endif
 
 namespace fcitx {
 
@@ -56,13 +67,7 @@ void startProcess(const std::vector<std::string> &args,
 }
 
 std::string getProcessName(pid_t pid) {
-#if defined(__linux__)
-    auto path = fmt::format("/proc/{}/exe", pid);
-    if (auto link = fs::readlink(path)) {
-        return fs::baseName(*link);
-    }
-    return {};
-#elif defined(LIBKVM_FOUND)
+#if defined(LIBKVM_FOUND)
 #if defined(__NetBSD__) || defined(__OpenBSD__)
     kvm_t *vm = kvm_open(nullptr, nullptr, nullptr, KVM_NO_FILES, nullptr);
 #else
@@ -102,8 +107,20 @@ std::string getProcessName(pid_t pid) {
     } while (0);
     kvm_close(vm);
     return result;
-#else
+#elif defined(__APPLE__)
+    std::string result;
+    result.reserve(2 * MAXCOMLEN);
+
+    if (proc_name(pid, result.data(), 2 * MAXCOMLEN)) {
+        return {};
+    }
     return result;
+#else
+    auto path = fmt::format("/proc/{}/exe", pid);
+    if (auto link = fs::readlink(path)) {
+        return fs::baseName(*link);
+    }
+    return {};
 #endif
 }
 

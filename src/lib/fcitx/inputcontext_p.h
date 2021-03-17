@@ -9,13 +9,13 @@
 
 #include <unordered_map>
 #include <fcitx-utils/intrusivelist.h>
+#include <fcitx-utils/uuid_p.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputcontextproperty.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
 #include <fcitx/statusarea.h>
-#include <uuid.h>
 
 namespace fcitx {
 
@@ -24,9 +24,8 @@ public:
     InputContextPrivate(InputContext *q, InputContextManager &manager,
                         const std::string &program)
         : QPtrHolder(q), manager_(manager), group_(nullptr), inputPanel_(q),
-          statusArea_(q), hasFocus_(false), program_(program) {
-        uuid_generate(uuid_.data());
-    }
+          statusArea_(q), program_(program),
+          isPreeditEnabled_(manager.isPreeditEnabledByDefault()) {}
 
     template <typename E>
     bool postEvent(E &&event) {
@@ -40,7 +39,7 @@ public:
     }
 
     template <typename E, typename... Args>
-    bool emplaceEvent(Args &&... args) {
+    bool emplaceEvent(Args &&...args) {
         if (destroyed_) {
             return true;
         }
@@ -51,7 +50,7 @@ public:
     }
 
     template <typename E, typename... Args>
-    void pushEvent(Args &&... args) {
+    void pushEvent(Args &&...args) {
         if (destroyed_) {
             return;
         }
@@ -86,7 +85,7 @@ public:
             return;
         }
         if (commitBuffer && !commitBuffer->empty() &&
-            icEvent.type() == EventType::InputContextForwardKey) {
+            (icEvent.type() != EventType::InputContextCommitString)) {
             q->commitStringImpl(*commitBuffer);
             commitBuffer->clear();
         }
@@ -146,7 +145,7 @@ public:
     bool isPreeditEnabled_ = true;
     SurroundingText surroundingText_;
     Rect cursorRect_;
-    double scale_;
+    double scale_ = 1.0;
 
     IntrusiveListNode listNode_;
     IntrusiveListNode focusedListNode_;

@@ -33,12 +33,12 @@ FCITX_CONFIGURATION(
     KeyListOption triggerKey{
         this,
         "TriggerKey",
-        "Trigger Key",
+        _("Trigger Key"),
         {Key("Super+grave"), Key("Super+semicolon")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
     OptionWithAnnotation<QuickPhraseChooseModifier,
                          QuickPhraseChooseModifierI18NAnnotation>
-        chooseModifier{this, "Choose Modifier", "Choose key modifier",
+        chooseModifier{this, "Choose Modifier", _("Choose key modifier"),
                        QuickPhraseChooseModifier::NoModifier};
     Option<bool> enableSpell{this, "Spell", _("Enable Spell check"), true};
     Option<std::string> fallbackSpellLanguage{
@@ -75,6 +75,7 @@ public:
     void trigger(InputContext *ic, const std::string &text,
                  const std::string &prefix, const std::string &str,
                  const std::string &alt, const Key &key);
+    void setBuffer(InputContext *ic, const std::string &text);
 
     std::unique_ptr<HandlerTableEntry<QuickPhraseProviderCallback>>
         addProvider(QuickPhraseProviderCallback);
@@ -82,6 +83,7 @@ public:
 private:
     FCITX_ADDON_EXPORT_FUNCTION(QuickPhrase, trigger);
     FCITX_ADDON_EXPORT_FUNCTION(QuickPhrase, addProvider);
+    FCITX_ADDON_EXPORT_FUNCTION(QuickPhrase, setBuffer);
 
     void setSelectionKeys(QuickPhraseAction action);
 

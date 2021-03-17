@@ -1,0 +1,8 @@
+[Addon]
+Name=Spell
+Type=SharedLibrary
+Library=spell
+Category=Module
+Version=@PROJECT_VERSION@
+OnDemand=True
+Configurable=True

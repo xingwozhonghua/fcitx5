@@ -156,12 +156,14 @@ void testSyncDefaultToCurrent() {
     RawConfig raw;
     config.dumpDescription(raw);
 
+    FCITX_ASSERT(raw.valueByPath("TestConfig/IntOption/DefaultValue"));
     FCITX_ASSERT(*raw.valueByPath("TestConfig/IntOption/DefaultValue") == "0");
 
     raw.removeAll();
     *config.intValue.mutableValue() = 3;
     config.syncDefaultValueToCurrent();
     config.dumpDescription(raw);
+    FCITX_ASSERT(raw.valueByPath("TestConfig/IntOption/DefaultValue"));
     FCITX_ASSERT(*raw.valueByPath("TestConfig/IntOption/DefaultValue") == "3");
 
     raw.removeAll();
@@ -169,14 +171,28 @@ void testSyncDefaultToCurrent() {
     FCITX_ASSERT(*config.subConfigValue->intValue == 10);
     config.syncDefaultValueToCurrent();
     config.dumpDescription(raw);
-    FCITX_ASSERT(*raw.valueByPath("TestSubConfig/IntOption/DefaultValue") ==
+    FCITX_ASSERT(*raw.valueByPath(
+                     "SubConfigOption$TestSubConfig/IntOption/DefaultValue") ==
                  "10");
 
     raw.removeAll();
     config.subConfigValue->dumpDescription(raw);
     config.dumpDescription(raw);
-    FCITX_ASSERT(*raw.valueByPath("TestSubConfig/IntOption/DefaultValue") ==
+    FCITX_ASSERT(*raw.valueByPath(
+                     "SubConfigOption$TestSubConfig/IntOption/DefaultValue") ==
                  "10");
+}
+
+void testExtend() {
+    TestConfigExt ext;
+    *ext.intValue.mutableValue() = 4;
+    *ext.newOption.mutableValue() = {"BCD", "DEF"};
+
+    TestConfigExt ext2;
+    ext2 = ext;
+    std::vector<std::string> expect = {"BCD", "DEF"};
+    FCITX_ASSERT(*ext.intValue == 4);
+    FCITX_ASSERT(*ext.newOption == expect);
 }
 
 int main() {
@@ -185,5 +201,6 @@ int main() {
     testAssign();
     testRecursiveAssign();
     testSyncDefaultToCurrent();
+    testExtend();
     return 0;
 }

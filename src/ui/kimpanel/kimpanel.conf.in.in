@@ -1,0 +1,11 @@
+[Addon]
+Name=KDE Input Method Panel
+Type=SharedLibrary
+Library=kimpanel
+Category=UI
+Version=@PROJECT_VERSION@
+UIPriority=50
+OnDemand=True
+
+[Addon/Dependencies]
+0=dbus

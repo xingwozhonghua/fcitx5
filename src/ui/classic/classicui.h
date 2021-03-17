@@ -21,7 +21,9 @@
 #include "fcitx/instance.h"
 #include "fcitx/userinterface.h"
 #include "theme.h"
+#ifdef ENABLE_X11
 #include "xcb_public.h"
+#endif
 #ifdef WAYLAND_FOUND
 #include "wayland_public.h"
 #endif
@@ -52,11 +54,16 @@ struct ThemeAnnotation : public EnumAnnotation {
     }
     void dumpDescription(RawConfig &config) const {
         EnumAnnotation::dumpDescription(config);
+        config.setValueByPath("LaunchSubConfig", "True");
         for (size_t i = 0; i < themes_.size(); i++) {
             config.setValueByPath("Enum/" + std::to_string(i),
                                   themes_[i].first);
             config.setValueByPath("EnumI18n/" + std::to_string(i),
                                   themes_[i].second);
+            config.setValueByPath(
+                "SubConfigPath/" + std::to_string(i),
+                stringutils::concat("fcitx://config/addon/classicui/theme/",
+                                    themes_[i].first));
         }
     }
 
@@ -64,21 +71,47 @@ private:
     std::vector<std::pair<std::string, std::string>> themes_;
 };
 
-FCITX_CONFIGURATION(ClassicUIConfig,
-                    Option<bool> verticalCandidateList{
-                        this, "Vertical Candidate List",
-                        _("Vertical Candidate List"), false};
-                    Option<bool> perScreenDPI{this, "PerScreenDPI",
-                                              _("Use Per Screen DPI"), true};
-                    Option<bool> useWheelForPaging{
-                        this, "WheelForPaging",
-                        _("Use mouse wheel to go to prev or next page"), true};
+struct MenuFontAnnotation : private FontAnnotation, private ToolTipAnnotation {
+    MenuFontAnnotation()
+        : ToolTipAnnotation(
+              _("This is only effective when the tray icon is xembed.")) {}
 
-                    OptionWithAnnotation<std::string, FontAnnotation> font{
-                        this, "Font", "Font", "Sans 9"};
-                    Option<std::string, NotEmpty,
-                           DefaultMarshaller<std::string>, ThemeAnnotation>
-                        theme{this, "Theme", _("Theme"), "default"};);
+    bool skipDescription() { return false; }
+    bool skipSave() { return false; }
+    void dumpDescription(RawConfig &config) {
+        FontAnnotation::dumpDescription(config);
+        ToolTipAnnotation::dumpDescription(config);
+    }
+};
+
+FCITX_CONFIGURATION(
+    ClassicUIConfig,
+    Option<bool> verticalCandidateList{this, "Vertical Candidate List",
+                                       _("Vertical Candidate List"), false};
+    Option<bool> perScreenDPI{this, "PerScreenDPI", _("Use Per Screen DPI"),
+                              true};
+    Option<bool> useWheelForPaging{
+        this, "WheelForPaging", _("Use mouse wheel to go to prev or next page"),
+        true};
+
+    OptionWithAnnotation<std::string, FontAnnotation> font{
+        this, "Font", _("Font"), "Sans 10"};
+    OptionWithAnnotation<std::string, MenuFontAnnotation> menuFont{
+        this, "MenuFont", _("Menu Font"), "Sans 10"};
+    OptionWithAnnotation<bool, ToolTipAnnotation>
+        useInputMethodLanguageToDisplayText{
+            this,
+            "UseInputMethodLangaugeToDisplayText",
+            _("Use input method langauge to display text"),
+            true,
+            {},
+            {},
+            {_("For example, display character with Chinese variant when using "
+               "Pinyin and Japanese variant when using Anthy. The font "
+               "configuration needs to support this to use this feature.")}};
+    Option<std::string, NotEmpty, DefaultMarshaller<std::string>,
+           ThemeAnnotation>
+        theme{this, "Theme", _("Theme"), "default"};);
 
 class ClassicUI final : public UserInterface {
 public:
@@ -95,6 +128,9 @@ public:
         safeSaveAsIni(config_, "conf/classicui.conf");
         reloadTheme();
     }
+    const Configuration *getSubConfig(const std::string &path) const override;
+    void setSubConfig(const std::string &path,
+                      const RawConfig &config) override;
     auto &config() { return config_; }
     Theme &theme() { return theme_; }
     void suspend() override;
@@ -112,9 +148,11 @@ private:
     UIInterface *uiForInputContext(InputContext *inputContext);
     void reloadTheme();
 
+#ifdef ENABLE_X11
     std::unique_ptr<HandlerTableEntry<XCBConnectionCreated>>
         xcbCreatedCallback_;
     std::unique_ptr<HandlerTableEntry<XCBConnectionClosed>> xcbClosedCallback_;
+#endif
 
 #ifdef WAYLAND_FOUND
     std::unique_ptr<HandlerTableEntry<WaylandConnectionCreated>>
@@ -132,6 +170,7 @@ private:
     Instance *instance_;
     ClassicUIConfig config_;
     Theme theme_;
+    mutable Theme subconfigTheme_;
     bool suspended_ = true;
 };
 } // namespace classicui

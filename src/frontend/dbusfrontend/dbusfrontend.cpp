@@ -16,6 +16,7 @@
 #include "fcitx/inputmethodmanager.h"
 #include "fcitx/instance.h"
 #include "fcitx/misc_p.h"
+#include "fcitx/userinterfacemanager.h"
 #include "dbus_public.h"
 
 #define FCITX_INPUTMETHOD_DBUS_INTERFACE "org.fcitx.Fcitx.InputMethod1"
@@ -24,6 +25,21 @@
 namespace fcitx {
 
 namespace {
+
+bool useClientSideUI(Instance *instance) {
+    if (instance->userInterfaceManager().currentUI() != "kimpanel") {
+        return true;
+    }
+    std::string desktop;
+    auto *desktopEnv = getenv("XDG_CURRENT_DESKTOP");
+    if (desktopEnv) {
+        desktop = desktopEnv;
+    }
+    if (desktop == "GNOME") {
+        return false;
+    }
+    return true;
+}
 
 std::vector<dbus::DBusStruct<std::string, int>>
 buildFormattedTextVector(const Text &text) {
@@ -131,6 +147,8 @@ public:
         preeditStrings = buildFormattedTextVector(preedit);
         auxUpStrings = buildFormattedTextVector(auxUp);
         auxDownStrings = buildFormattedTextVector(auxDown);
+        bool hasPrev = false, hasNext = false;
+        int layoutHint = 0;
         if (candidateList) {
             for (int i = 0, e = candidateList->size(); i < e; i++) {
                 auto &candidate = candidateList->candidate(i);
@@ -147,10 +165,15 @@ public:
                     labelText.toString(), candidateText.toString()));
             }
             cursorIndex = candidateList->cursorIndex();
+            if (auto *pageable = candidateList->toPageable()) {
+                hasPrev = pageable->hasPrev();
+                hasNext = pageable->hasNext();
+            }
+            layoutHint = static_cast<int>(candidateList->layoutHint());
         }
         updateClientSideUITo(name_, preeditStrings, preedit.cursor(),
                              auxUpStrings, auxDownStrings, candidates,
-                             cursorIndex);
+                             cursorIndex, layoutHint, hasPrev, hasNext);
     }
 
     void forwardKeyImpl(const ForwardKeyEvent &key) override {
@@ -190,7 +213,8 @@ public:
 
     void setCapability(uint64_t cap) {
         CHECK_SENDER_OR_RETURN;
-        setCapabilityFlags(CapabilityFlags{cap});
+        rawCapabilityFlags_ = CapabilityFlags(cap);
+        updateCapability();
     }
 
     void setSurroundingText(const std::string &str, uint32_t cursor,
@@ -201,8 +225,8 @@ public:
     }
 
     void setSurroundingTextPosition(uint32_t cursor, uint32_t anchor) {
-        surroundingText().setCursor(cursor, anchor);
         CHECK_SENDER_OR_RETURN;
+        surroundingText().setCursor(cursor, anchor);
         updateSurroundingText();
     }
 
@@ -225,6 +249,53 @@ public:
         return keyEvent(event);
     }
 
+    void prevPage() {
+        CHECK_SENDER_OR_RETURN;
+        if (auto candidateList = inputPanel().candidateList()) {
+            if (auto *pageable = candidateList->toPageable()) {
+                if (pageable->hasPrev()) {
+                    pageable->prev();
+                    updateUserInterface(UserInterfaceComponent::InputPanel);
+                }
+            }
+        }
+    }
+
+    void nextPage() {
+        CHECK_SENDER_OR_RETURN;
+        if (auto candidateList = inputPanel().candidateList()) {
+            if (auto *pageable = candidateList->toPageable()) {
+                if (pageable->hasNext()) {
+                    pageable->next();
+                    updateUserInterface(UserInterfaceComponent::InputPanel);
+                }
+            }
+        }
+    }
+
+    void selectCandidate(int idx) {
+        CHECK_SENDER_OR_RETURN;
+        if (auto candidateList = inputPanel().candidateList()) {
+            const auto *candidate =
+                nthCandidateIgnorePlaceholder(*candidateList, idx);
+            if (candidate) {
+                candidate->select(this);
+            }
+        }
+    }
+
+    void updateCapability() {
+        CapabilityFlags flags = rawCapabilityFlags_;
+        if (stringutils::startsWith(display(), "x11:")) {
+            flags = flags.unset(CapabilityFlag::ClientSideInputPanel);
+        } else if (stringutils::startsWith(display(), "wayland:")) {
+            if (!useClientSideUI(im_->instance())) {
+                flags = flags.unset(CapabilityFlag::ClientSideInputPanel);
+            }
+        }
+        setCapabilityFlags(flags);
+    }
+
 private:
     FCITX_OBJECT_VTABLE_METHOD(focusInDBus, "FocusIn", "", "");
     FCITX_OBJECT_VTABLE_METHOD(focusOutDBus, "FocusOut", "", "");
@@ -240,20 +311,34 @@ private:
     FCITX_OBJECT_VTABLE_METHOD(destroyDBus, "DestroyIC", "", "");
     FCITX_OBJECT_VTABLE_METHOD(processKeyEvent, "ProcessKeyEvent", "uuubu",
                                "b");
+
+    FCITX_OBJECT_VTABLE_METHOD(prevPage, "PrevPage", "", "");
+    FCITX_OBJECT_VTABLE_METHOD(nextPage, "NextPage", "", "");
+    FCITX_OBJECT_VTABLE_METHOD(selectCandidate, "SelectCandidate", "i", "");
+
     FCITX_OBJECT_VTABLE_SIGNAL(commitStringDBus, "CommitString", "s");
     FCITX_OBJECT_VTABLE_SIGNAL(currentIM, "CurrentIM", "sss");
     FCITX_OBJECT_VTABLE_SIGNAL(updateFormattedPreedit, "UpdateFormattedPreedit",
                                "a(si)i");
     FCITX_OBJECT_VTABLE_SIGNAL(deleteSurroundingTextDBus,
                                "DeleteSurroundingText", "iu");
+    // This is contains:
+    // - a(si)i preedit
+    // - a(si) aux up
+    // - a(si) aux aux
+    // - a(ss) candidate label + text
+    // - i candidate index
+    // - i candidate layout
+    // - bb prev page / next page
     FCITX_OBJECT_VTABLE_SIGNAL(updateClientSideUI, "UpdateClientSideUI",
-                               "a(si)ia(si)a(si)a(ss)i");
+                               "a(si)ia(si)a(si)a(ss)iibb");
     FCITX_OBJECT_VTABLE_SIGNAL(forwardKeyDBus, "ForwardKey", "uub");
 
     dbus::ObjectPath path_;
     InputMethod1 *im_;
     std::unique_ptr<HandlerTableEntry<dbus::ServiceWatcherCallback>> handler_;
     std::string name_;
+    CapabilityFlags rawCapabilityFlags_;
 };
 
 std::tuple<dbus::ObjectPath, std::vector<uint8_t>>
@@ -288,7 +373,7 @@ InputMethod1::createInputContext(
 
 DBusFrontendModule::DBusFrontendModule(Instance *instance)
     : instance_(instance),
-      portalBus_(std::make_unique<dbus::Bus>(dbus::BusType::Session)),
+      portalBus_(std::make_unique<dbus::Bus>(bus()->address())),
       inputMethod1_(std::make_unique<InputMethod1>(
           this, bus(), "/org/freedesktop/portal/inputmethod")),
       inputMethod1Compatible_(std::make_unique<InputMethod1>(
@@ -304,7 +389,7 @@ DBusFrontendModule::DBusFrontendModule(Instance *instance)
         FCITX_WARN() << "Can not get portal dbus name right now.";
     }
 
-    event_ = instance_->watchEvent(
+    events_.emplace_back(instance_->watchEvent(
         EventType::InputContextInputMethodActivated, EventWatcherPhase::Default,
         [this](Event &event) {
             auto &activated = static_cast<InputMethodActivatedEvent &>(event);
@@ -315,7 +400,16 @@ DBusFrontendModule::DBusFrontendModule(Instance *instance)
                     static_cast<DBusInputContext1 *>(ic)->updateIM(entry);
                 }
             }
-        });
+        }));
+    events_.emplace_back(instance_->watchEvent(
+        EventType::UIChanged, EventWatcherPhase::Default, [this](Event &) {
+            instance_->inputContextManager().foreach([](InputContext *ic) {
+                if (strcmp(ic->frontend(), "dbus") == 0) {
+                    static_cast<DBusInputContext1 *>(ic)->updateCapability();
+                }
+                return true;
+            });
+        }));
 }
 
 DBusFrontendModule::~DBusFrontendModule() {

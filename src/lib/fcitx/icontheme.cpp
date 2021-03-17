@@ -8,15 +8,51 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <ctime>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include "fcitx-config/iniparser.h"
 #include "fcitx-config/marshallfunction.h"
 #include "fcitx-utils/fs.h"
 #include "fcitx-utils/log.h"
+#include "config.h"
 
 namespace fcitx {
+
+namespace {
+
+struct Timespec {
+    int64_t sec;
+    int64_t nsec;
+};
+
+template <typename T>
+inline std::enable_if_t<(&T::st_mtim, true), Timespec>
+modifiedTime(const T &p) {
+    return {p.st_mtim.tv_sec, p.st_mtim.tv_nsec};
+}
+
+// This check is necessary because on FreeBSD st_mtimespec is defined as
+// st_mtim. This would cause a redefinition.
+#if !defined(st_mtimespec)
+template <typename T>
+inline std::enable_if_t<(&T::st_mtimespec, true), Timespec>
+modifiedTime(const T &p) {
+    return {p.st_mtimespec.tv_sec, p.st_mtimespec.tv_nsec};
+}
+#endif
+
+#if !defined(st_mtimensec) && !defined(__alpha__)
+template <typename T>
+inline std::enable_if_t<(&T::st_mtimensec, true), Timespec>
+modifiedTime(const T &p) {
+    return {p.st_mtime, p.st_mtimensec};
+}
+#endif
+
+} // namespace
 
 std::string pathToRoot(const RawConfig &config) {
     std::string path;
@@ -157,11 +193,11 @@ FCITX_DEFINE_READ_ONLY_PROPERTY_PRIVATE(IconThemeDirectory, int, maxSize);
 FCITX_DEFINE_READ_ONLY_PROPERTY_PRIVATE(IconThemeDirectory, int, minSize);
 FCITX_DEFINE_READ_ONLY_PROPERTY_PRIVATE(IconThemeDirectory, int, threshold);
 
-bool timespecLess(const timespec &lhs, const timespec &rhs) {
-    if (lhs.tv_sec != rhs.tv_sec) {
-        return lhs.tv_sec < rhs.tv_sec;
+bool timespecLess(const Timespec &lhs, const Timespec &rhs) {
+    if (lhs.sec != rhs.sec) {
+        return lhs.sec < rhs.sec;
     }
-    return lhs.tv_nsec < rhs.tv_nsec;
+    return lhs.nsec < rhs.nsec;
 }
 
 static uint32_t iconNameHash(const char *p) {
@@ -188,7 +224,7 @@ public:
         if (stat(dirName.c_str(), &dirSt) != 0) {
             return;
         }
-        if (timespecLess(st.st_mtim, dirSt.st_mtim)) {
+        if (timespecLess(modifiedTime(st), modifiedTime(dirSt))) {
             return;
         }
 
@@ -227,7 +263,7 @@ public:
                 isValid_ = false;
                 return;
             }
-            if (timespecLess(st.st_mtim, subDirSt.st_mtim)) {
+            if (timespecLess(modifiedTime(st), modifiedTime(subDirSt))) {
                 isValid_ = false;
                 return;
             }
@@ -602,10 +638,14 @@ public:
     }
 
     void prepare() {
-        addBaseDir(stringutils::joinPath(home_, ".icons", internalName_));
-        addBaseDir(stringutils::joinPath(
-            standardPath_.userDirectory(StandardPath::Type::Data), "icons",
-            internalName_));
+        if (!home_.empty()) {
+            addBaseDir(stringutils::joinPath(home_, ".icons", internalName_));
+        }
+        if (auto userDir =
+                standardPath_.userDirectory(StandardPath::Type::Data);
+            !userDir.empty()) {
+            addBaseDir(stringutils::joinPath(userDir, "icons", internalName_));
+        }
 
         for (auto &dataDir :
              standardPath_.directories(StandardPath::Type::Data)) {
@@ -784,7 +824,7 @@ std::string IconTheme::defaultIconThemeName() {
             }
         }
 
-        return "oxygen";
+        return "breeze";
     }
     case DesktopType::KDE4: {
         const char *home = getenv("HOME");
@@ -801,13 +841,9 @@ std::string IconTheme::defaultIconThemeName() {
                 }
             }
         }
-        return "breeze";
+        return "oxygen";
     }
-    case DesktopType::GNOME:
-    case DesktopType::Cinnamon:
-    case DesktopType::LXDE:
-    case DesktopType::MATE:
-    case DesktopType::XFCE: {
+    default: {
         auto files = StandardPath::global().openAll(
             StandardPath::Type::Config, "gtk-3.0/settings.ini", O_RDONLY);
         for (auto &file : files) {
@@ -833,13 +869,26 @@ std::string IconTheme::defaultIconThemeName() {
                 }
             }
         }
-
-        return "gnome";
-    }
-    default:
-        break;
+    } break;
     }
 
-    return "Tango";
+    if (desktopType == DesktopType::Unknown) {
+        return "Tango";
+    } else if (desktopType == DesktopType::GNOME) {
+        return "Adwaita";
+    }
+    return "gnome";
+}
+
+/// Rename fcitx-* icon to org.fcitx.Fcitx5.fcitx-* if in flatpak
+std::string IconTheme::iconName(const std::string &icon, bool inFlatpak) {
+#ifdef USE_FLATPAK_ICON
+    if (inFlatpak && stringutils::startsWith(icon, "fcitx-")) {
+        return stringutils::concat("org.fcitx.Fcitx5.", icon);
+    }
+#else
+    FCITX_UNUSED(inFlatpak);
+#endif
+    return icon;
 }
 } // namespace fcitx

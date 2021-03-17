@@ -11,6 +11,7 @@
 #include <xcb-imdkit/encoding.h>
 #include <xcb/xcb_aux.h>
 #include <xkbcommon/xkbcommon.h>
+#include "fcitx-utils/misc_p.h"
 #include "fcitx-utils/stringutils.h"
 #include "fcitx-utils/utf8.h"
 #include "fcitx/focusgroup.h"
@@ -43,10 +44,9 @@ uint32_t onthespot_style_array[] = {
 };
 
 char COMPOUND_TEXT[] = "COMPOUND_TEXT";
+char UTF8_STRING[] = "UTF8_STRING";
 
-char *encoding_array[] = {
-    COMPOUND_TEXT,
-};
+char *encoding_array[] = {COMPOUND_TEXT, UTF8_STRING};
 
 xcb_im_encodings_t encodings = {FCITX_ARRAY_SIZE(encoding_array),
                                 encoding_array};
@@ -113,7 +113,7 @@ public:
         if (::xim().checkLogLevel(LogLevel::Debug)) {
             xcb_im_set_log_handler(im_.get(), XimLogFunc);
         }
-        xcb_im_set_use_sync_mode(im_.get(), false);
+        xcb_im_set_use_sync_mode(im_.get(), true);
 
         filter_ = parent_->xcb()->call<fcitx::IXCBModule::addEventFilter>(
             name, [this](xcb_connection_t *, xcb_generic_event_t *event) {
@@ -176,7 +176,18 @@ private:
     xcb_window_t serverWindow_;
     xcb_ewmh_connection_t *ewmh_;
     std::unique_ptr<HandlerTableEntry<XCBEventFilter>> filter_;
+    // bool value: isUtf8
+    std::unordered_map<xcb_im_client_t *, bool> clientEncodingMapping_;
 };
+
+pid_t getWindowPid(xcb_ewmh_connection_t *ewmh, xcb_window_t w) {
+    auto cookie = xcb_ewmh_get_wm_pid(ewmh, w);
+    uint32_t pid = 0;
+    if (xcb_ewmh_get_wm_pid_reply(ewmh, cookie, &pid, nullptr) == 1) {
+        return pid;
+    }
+    return 0;
+}
 
 std::string getProgramName(XIMServer *server, xcb_im_input_context_t *ic) {
     auto w = xcb_im_input_context_get_client_window(ic);
@@ -184,11 +195,22 @@ std::string getProgramName(XIMServer *server, xcb_im_input_context_t *ic) {
         w = xcb_im_input_context_get_focus_window(ic);
     }
     if (w) {
-        auto cookie = xcb_ewmh_get_wm_pid(server->ewmh(), w);
-        uint32_t pid;
-        if (xcb_ewmh_get_wm_pid_reply(server->ewmh(), cookie, &pid, nullptr) ==
-            1) {
-            return getProcessName(pid);
+        while (w != server->root()) {
+            if (auto pid = getWindowPid(server->ewmh(), w)) {
+                return getProcessName(pid);
+            }
+
+            auto cookie = xcb_query_tree(server->conn(), w);
+            auto reply = makeUniqueCPtr(
+                xcb_query_tree_reply(server->conn(), cookie, nullptr));
+            if (!reply) {
+                break;
+            }
+            // This should never happen, but just as a sanity check.
+            if (reply->root != server->root() || w == reply->parent) {
+                break;
+            }
+            w = reply->parent;
         }
     }
     return {};
@@ -197,17 +219,19 @@ std::string getProgramName(XIMServer *server, xcb_im_input_context_t *ic) {
 class XIMInputContext final : public InputContext {
 public:
     XIMInputContext(InputContextManager &inputContextManager, XIMServer *server,
-                    xcb_im_input_context_t *ic)
+                    xcb_im_input_context_t *ic, bool useUtf8)
         : InputContext(inputContextManager, getProgramName(server, ic)),
-          server_(server), xic_(ic) {
+          server_(server), xic_(ic), useUtf8_(useUtf8) {
         setFocusGroup(server->focusGroup());
         xcb_im_input_context_set_data(xic_, this, nullptr);
         auto style = xcb_im_input_context_get_input_style(ic);
         created();
+        CapabilityFlags flags = CapabilityFlag::ReportKeyRepeat;
         if (style & XCB_IM_PreeditCallbacks) {
-            setCapabilityFlags(
-                {CapabilityFlag::Preedit, CapabilityFlag::FormattedPreedit});
+            flags = flags | CapabilityFlag::Preedit;
+            flags = flags | CapabilityFlag::FormattedPreedit;
         }
+        setCapabilityFlags(flags);
     }
     ~XIMInputContext() {
         xcb_im_input_context_set_data(xic_, nullptr, nullptr);
@@ -258,18 +282,65 @@ public:
         }
     }
 
+    KeyStates updateAutoRepeatState(xcb_key_press_event_t *xevent) {
+        // Client may or may not call XkbSetDetectableAutoRepeat, so we must
+        // handle both cases.
+        bool isAutoRepeat = false;
+        bool isRelease = (xevent->response_type & ~0x80) == XCB_KEY_RELEASE;
+        if (isRelease) {
+            // Always mark key release as non auto repeat, because we don't know
+            // if it is real release.
+            isAutoRepeat = false;
+        } else {
+            // If timestamp is same as last release
+            if (lastIsRelease_) {
+                if (lastTime_ && lastTime_ == xevent->time &&
+                    lastKeyCode_ == xevent->detail) {
+                    isAutoRepeat = true;
+                }
+            } else {
+                if (lastKeyCode_ == xevent->detail) {
+                    isAutoRepeat = true;
+                }
+            }
+        }
+
+        lastKeyCode_ = xevent->detail;
+        lastIsRelease_ = isRelease;
+        lastTime_ = xevent->time;
+        KeyStates states(xevent->state);
+        if (isAutoRepeat) {
+            // KeyState::Repeat
+            states = states | KeyState::Repeat;
+        }
+        return states;
+    }
+
+    void resetAutoRepeatState() {
+        lastKeyCode_ = 0;
+        lastIsRelease_ = false;
+        lastTime_ = 0;
+    }
+
 protected:
     void commitStringImpl(const std::string &text) override {
-        size_t compoundTextLength;
-        UniqueCPtr<char> compoundText(xcb_utf8_to_compound_text(
-            text.c_str(), text.size(), &compoundTextLength));
-        if (!compoundText) {
-            return;
+        UniqueCPtr<char> compoundText;
+        const char *commit = text.data();
+        size_t length = text.size();
+        if (!useUtf8_) {
+            size_t compoundTextLength;
+            compoundText.reset(xcb_utf8_to_compound_text(
+                text.c_str(), text.size(), &compoundTextLength));
+            if (!compoundText) {
+                return;
+            }
+            commit = compoundText.get();
+            length = compoundTextLength;
         }
         XIM_DEBUG() << "XIM commit: " << text;
 
-        xcb_im_commit_string(server_->im(), xic_, XCB_XIM_LOOKUP_CHARS,
-                             compoundText.get(), compoundTextLength, 0);
+        xcb_im_commit_string(server_->im(), xic_, XCB_XIM_LOOKUP_CHARS, commit,
+                             length, 0);
     }
     void deleteSurroundingTextImpl(int, unsigned int) override {}
     void forwardKeyImpl(const ForwardKeyEvent &key) override {
@@ -366,17 +437,25 @@ protected:
                     utf8::length(strPreedit.begin(),
                                  std::next(strPreedit.begin(), text.cursor()));
             }
+            UniqueCPtr<char> compoundText;
             frame.chg_first = 0;
             frame.chg_length = lastPreeditLength_;
-            size_t compoundTextLength;
-            UniqueCPtr<char> compoundText(xcb_utf8_to_compound_text(
-                strPreedit.c_str(), strPreedit.size(), &compoundTextLength));
-            if (!compoundText) {
-                return;
+            if (useUtf8_) {
+                frame.preedit_string =
+                    reinterpret_cast<uint8_t *>(strPreedit.data());
+                frame.length_of_preedit_string = strPreedit.size();
+            } else {
+                size_t compoundTextLength;
+                compoundText.reset(xcb_utf8_to_compound_text(
+                    strPreedit.c_str(), strPreedit.size(),
+                    &compoundTextLength));
+                if (!compoundText) {
+                    return;
+                }
+                frame.length_of_preedit_string = compoundTextLength;
+                frame.preedit_string =
+                    reinterpret_cast<uint8_t *>(compoundText.get());
             }
-            frame.length_of_preedit_string = compoundTextLength;
-            frame.preedit_string =
-                reinterpret_cast<uint8_t *>(compoundText.get());
             frame.feedback_array.size = feedbackBuffer_.size();
             frame.feedback_array.items = feedbackBuffer_.data();
             frame.status = frame.feedback_array.size ? 0 : 2;
@@ -388,18 +467,37 @@ protected:
 private:
     XIMServer *server_;
     xcb_im_input_context_t *xic_;
+    const bool useUtf8_ = false;
     bool preeditStarted = false;
     int lastPreeditLength_ = 0;
     std::vector<uint32_t> feedbackBuffer_;
+    bool lastIsRelease_ = false;
+    unsigned int lastTime_ = 0;
+    unsigned int lastKeyCode_ = 0;
 };
 
 void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
                          const xcb_im_packet_header_fr_t *hdr, void *frame,
                          void *arg) {
-    FCITX_UNUSED(client);
     FCITX_UNUSED(hdr);
     FCITX_UNUSED(frame);
-    FCITX_UNUSED(arg);
+
+    switch (hdr->major_opcode) {
+    case XCB_XIM_ENCODING_NEGOTIATION:
+        if (arg) {
+            auto encodingIndex = *static_cast<uint16_t *>(arg);
+            XIM_DEBUG() << "Client encoding: " << client << " "
+                        << encodingIndex;
+            if (encodingIndex != 0) {
+                clientEncodingMapping_[client] = encodingIndex == 1;
+            }
+        }
+        return;
+    case XCB_XIM_DISCONNECT:
+        XIM_DEBUG() << "Client disconnect: " << client;
+        clientEncodingMapping_.erase(client);
+        return;
+    }
 
     if (!xic) {
         return;
@@ -416,10 +514,15 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
     }
 
     switch (hdr->major_opcode) {
-    case XCB_XIM_CREATE_IC:
+    case XCB_XIM_CREATE_IC: {
+        bool useUtf8 = false;
+        if (auto entry = findValue(clientEncodingMapping_, client);
+            entry && *entry) {
+            useUtf8 = true;
+        }
         new XIMInputContext(parent_->instance()->inputContextManager(), this,
-                            xic);
-        break;
+                            xic, useUtf8);
+    } break;
     case XCB_XIM_DESTROY_IC:
         delete ic;
         break;
@@ -437,7 +540,7 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
         KeyEvent event(ic,
                        Key(static_cast<KeySym>(xkb_state_key_get_one_sym(
                                state, xevent->detail)),
-                           KeyStates(xevent->state), xevent->detail),
+                           ic->updateAutoRepeatState(xevent), xevent->detail),
                        (xevent->response_type & ~0x80) == XCB_KEY_RELEASE,
                        xevent->time);
         XIM_KEY_DEBUG() << "XIM Key Event: "
@@ -447,11 +550,13 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
             ic->focusIn();
         }
 
+        bool result;
         {
             InputContextEventBlocker blocker(ic);
-            if (!ic->keyEvent(event)) {
-                xcb_im_forward_event(im(), xic, xevent);
-            }
+            result = ic->keyEvent(event);
+        }
+        if (!result) {
+            xcb_im_forward_event(im(), xic, xevent);
         }
         // Make sure xcb ui can be updated.
         instance()->flushUI();
@@ -465,6 +570,7 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
         ic->updateCursorLocation();
         break;
     case XCB_XIM_UNSET_IC_FOCUS:
+        ic->resetAutoRepeatState();
         ic->focusOut();
         break;
     }
