@@ -127,6 +127,7 @@ public:
                          void(InputContext *inputContext, Text &orig));
     FCITX_DECLARE_SIGNAL(Instance, KeyEventResult,
                          void(const KeyEvent &keyEvent));
+    FCITX_DECLARE_SIGNAL(Instance, CheckUpdate, bool());
 
     /// Return a focused input context.
     InputContext *lastFocusedInputContext();
@@ -172,6 +173,14 @@ public:
     void updateXkbStateMask(const std::string &display, uint32_t depressed_mods,
                             uint32_t latched_mods, uint32_t locked_mods);
     void showInputMethodInformation(InputContext *ic);
+
+    /**
+     * Check if need to invoke Instance::refresh.
+     *
+     * @return need update
+     * @see Instance::refresh
+     */
+    bool checkUpdate() const;
 
     static const char *version();
 

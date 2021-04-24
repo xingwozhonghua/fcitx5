@@ -43,6 +43,8 @@ public:
 
     FCITX_DEFINE_SIGNAL_PRIVATE(InputMethodManager, CurrentGroupAboutToChange);
     FCITX_DEFINE_SIGNAL_PRIVATE(InputMethodManager, CurrentGroupChanged);
+    FCITX_DEFINE_SIGNAL_PRIVATE(InputMethodManager, GroupAdded);
+    FCITX_DEFINE_SIGNAL_PRIVATE(InputMethodManager, GroupRemoved);
 
     AddonManager *addonManager_;
     std::list<std::string> groupOrder_;
@@ -51,6 +53,7 @@ public:
     std::unordered_map<std::string, InputMethodEntry> entries_;
     Instance *instance_ = nullptr;
     std::unique_ptr<HandlerTableEntry<EventHandler>> eventWatcher_;
+    int64_t timestamp_ = 0;
 };
 
 bool checkEntry(const InputMethodEntry &entry,
@@ -113,7 +116,6 @@ void InputMethodManagerPrivate::loadConfig(
     if (groups_.empty()) {
         FCITX_INFO() << "No valid input method group in configuration. "
                      << "Building a default one";
-        groups_.clear();
         buildDefaultGroup(buildDefaultGroupCallback);
     } else {
         if (!imConfig.groupOrder.value().empty()) {
@@ -127,6 +129,7 @@ void InputMethodManagerPrivate::loadConfig(
 void InputMethodManagerPrivate::buildDefaultGroup(
     const std::function<void(InputMethodManager &)>
         &buildDefaultGroupCallback) {
+    groups_.clear();
     if (buildDefaultGroupCallback) {
         buildingGroup_ = true;
         buildDefaultGroupCallback(*q_func());
@@ -141,11 +144,14 @@ void InputMethodManagerPrivate::buildDefaultGroup(
         group.setDefaultLayout("us");
         setGroupOrder({name});
     }
+    assert(!groups_.empty());
+    assert(!groupOrder_.empty());
 }
 
 void InputMethodManagerPrivate::loadStaticEntries(
     const std::unordered_set<std::string> &addonNames) {
     const auto &path = StandardPath::global();
+    timestamp_ = path.timestamp(StandardPath::Type::PkgData, "inputmethod");
     auto filesMap =
         path.multiOpenAll(StandardPath::Type::PkgData, "inputmethod", O_RDONLY,
                           filter::Suffix(".conf"));
@@ -228,7 +234,6 @@ void InputMethodManager::reset(const std::function<void(InputMethodManager &)>
     FCITX_D();
     emit<InputMethodManager::CurrentGroupAboutToChange>(
         d->groupOrder_.empty() ? "" : d->groupOrder_.front());
-    d->groups_.clear();
     d->buildDefaultGroup(buildDefaultGroupCallback);
     // groupOrder guarantee to be non-empty at this point.
     emit<InputMethodManager::CurrentGroupChanged>(d->groupOrder_.front());
@@ -238,6 +243,7 @@ void InputMethodManager::refresh() {
     FCITX_D();
     auto addonNames = d->addonManager_->addonNames(AddonCategory::InputMethod);
     d->loadStaticEntries(addonNames);
+    d->loadDynamicEntries(addonNames);
 }
 
 std::vector<std::string> InputMethodManager::groups() const {
@@ -285,27 +291,27 @@ InputMethodManager::group(const std::string &name) const {
 void InputMethodManager::setGroup(InputMethodGroup newGroupInfo) {
     FCITX_D();
     auto *group = findValue(d->groups_, newGroupInfo.name());
-    if (group) {
-        bool isCurrent = false;
-        if (!d->buildingGroup_) {
-            isCurrent = (group == &currentGroup());
-            if (isCurrent) {
-                emit<InputMethodManager::CurrentGroupAboutToChange>(
-                    d->groupOrder_.front());
-            }
-        }
-        auto &list = newGroupInfo.inputMethodList();
-        auto iter = std::remove_if(list.begin(), list.end(),
-                                   [d](const InputMethodGroupItem &item) {
-                                       return !d->entries_.count(item.name());
-                                   });
-        list.erase(iter, list.end());
-        newGroupInfo.setDefaultInputMethod(newGroupInfo.defaultInputMethod());
-        *group = std::move(newGroupInfo);
-        if (!d->buildingGroup_ && isCurrent) {
-            emit<InputMethodManager::CurrentGroupChanged>(
+    if (!group) {
+        return;
+    }
+    bool isCurrent = false;
+    if (!d->buildingGroup_) {
+        isCurrent = (group == &currentGroup());
+        if (isCurrent) {
+            emit<InputMethodManager::CurrentGroupAboutToChange>(
                 d->groupOrder_.front());
         }
+    }
+    auto &list = newGroupInfo.inputMethodList();
+    auto iter = std::remove_if(list.begin(), list.end(),
+                               [d](const InputMethodGroupItem &item) {
+                                   return !d->entries_.count(item.name());
+                               });
+    list.erase(iter, list.end());
+    newGroupInfo.setDefaultInputMethod(newGroupInfo.defaultInputMethod());
+    *group = std::move(newGroupInfo);
+    if (!d->buildingGroup_ && isCurrent) {
+        emit<InputMethodManager::CurrentGroupChanged>(d->groupOrder_.front());
     }
 }
 
@@ -341,6 +347,9 @@ void InputMethodManager::addEmptyGroup(const std::string &name) {
     }
     d->groups_.emplace(name, std::move(newGroup));
     d->groupOrder_.push_back(name);
+    if (!d->buildingGroup_) {
+        emit<InputMethodManager::GroupAdded>(name);
+    }
 }
 
 void InputMethodManager::removeGroup(const std::string &name) {
@@ -361,6 +370,9 @@ void InputMethodManager::removeGroup(const std::string &name) {
         if (isCurrent) {
             emit<InputMethodManager::CurrentGroupChanged>(
                 d->groupOrder_.front());
+        }
+        if (!d->buildingGroup_) {
+            emit<InputMethodManager::GroupRemoved>(name);
         }
     }
 }
@@ -416,6 +428,13 @@ void InputMethodManager::setGroupOrder(const std::vector<std::string> &groups) {
         throw std::runtime_error("Called not within building group");
     }
     d->setGroupOrder(groups);
+}
+
+bool InputMethodManager::checkUpdate() const {
+    FCITX_D();
+    auto timestamp = StandardPath::global().timestamp(
+        StandardPath::Type::PkgData, "inputmethod");
+    return timestamp > d->timestamp_;
 }
 
 } // namespace fcitx

@@ -213,6 +213,10 @@ std::optional<SemanticVersion> SemanticVersion::parse(std::string_view data) {
         }
     }
 
+    if (data.empty()) {
+        return version;
+    }
+
     if (data[0] == '+') {
         data.remove_prefix(1);
         if (auto result = consumeBuild(data)) {

@@ -49,6 +49,22 @@ namespace fcitx {
 
 namespace {
 
+/// \brief Combiner that return the last value.
+class CheckUpdateResult {
+public:
+    template <typename InputIterator>
+    bool operator()(InputIterator begin, InputIterator end) {
+        bool v = false;
+        for (; begin != end; begin++) {
+            v = v || *begin;
+            if (v) {
+                break;
+            }
+        }
+        return v;
+    }
+};
+
 constexpr uint64_t AutoSavePeriod = 1800ull * 1000000ull; // 30 minutes
 constexpr uint64_t AutoSaveIdleTime = 60ull * 1000000ull; // 1 minutes
 
@@ -270,6 +286,7 @@ struct InstanceArgument {
 class InstancePrivate : public QPtrHolder<Instance> {
 public:
     InstancePrivate(Instance *q) : QPtrHolder<Instance>(q) {
+
         const char *locale = getenv("LC_ALL");
         if (!locale) {
             locale = getenv("LC_CTYPE");
@@ -438,6 +455,8 @@ public:
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, CommitFilter);
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, OutputFilter);
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, KeyEventResult);
+    FCITX_DEFINE_SIGNAL_PRIVATE_WITH_COMBINER(Instance, CheckUpdate,
+                                              CheckUpdateResult);
 
     FactoryFor<InputState> inputStateFactory_{
         [this](InputContext &ic) { return new InputState(this, &ic); }};
@@ -1490,7 +1509,7 @@ bool Instance::postEvent(Event &event) {
                 // Re-forward the event to ensure we got delivered later than
                 // commit.
                 keyEvent.filterAndAccept();
-                ic->forwardKey(keyEvent.rawKey(), keyEvent.isRelease(),
+                ic->forwardKey(keyEvent.origKey(), keyEvent.isRelease(),
                                keyEvent.time());
             }
         }
@@ -2264,6 +2283,12 @@ void Instance::showInputMethodInformation(InputContext *ic) {
         return;
     }
     d->showInputMethodInformation(ic);
+}
+
+bool Instance::checkUpdate() const {
+    FCITX_D();
+    return d->addonManager_.checkUpdate() || d->imManager_.checkUpdate() ||
+           emit<Instance::CheckUpdate>();
 }
 
 void Instance::setXkbParameters(const std::string &display,
